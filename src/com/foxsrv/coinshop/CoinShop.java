@@ -10,6 +10,7 @@ import org.bukkit.configuration.file.*;
 import org.bukkit.entity.Player;
 import org.bukkit.event.*;
 import org.bukkit.event.inventory.*;
+import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.inventory.*;
 import org.bukkit.inventory.meta.ItemMeta;
@@ -71,6 +72,9 @@ public class CoinShop extends JavaPlugin implements Listener {
 
     // Player session tracking
     private final Map<UUID, PlayerSession> playerSessions = new ConcurrentHashMap<>();
+    
+    // Pending item returns for offline players
+    private final Map<UUID, List<ItemStack>> pendingItemReturns = new ConcurrentHashMap<>();
 
     // ====================================================
     // ON ENABLE / DISABLE
@@ -94,6 +98,7 @@ public class CoinShop extends JavaPlugin implements Listener {
         setupFolders();
         createExampleUser();
         loadStoreData();
+        loadPendingReturns();
 
         getServer().getPluginManager().registerEvents(this, this);
 
@@ -116,6 +121,7 @@ public class CoinShop extends JavaPlugin implements Listener {
             queueProcessorTask.cancel();
         }
         saveStoreData();
+        savePendingReturns();
         getLogger().info("CoinShop disabled.");
     }
 
@@ -309,6 +315,82 @@ public class CoinShop extends JavaPlugin implements Listener {
             }
         } catch (IOException e) {
             getLogger().log(Level.SEVERE, "Failed to save store data", e);
+        }
+    }
+
+    private void loadPendingReturns() {
+        File pendingFile = new File(getDataFolder(), "pending_returns.dat");
+        if (pendingFile.exists()) {
+            try (Reader reader = new FileReader(pendingFile)) {
+                JsonObject jsonObject = JsonParser.parseReader(reader).getAsJsonObject();
+                if (jsonObject.has("returns")) {
+                    JsonArray returnsArray = jsonObject.getAsJsonArray("returns");
+                    for (JsonElement element : returnsArray) {
+                        JsonObject returnObj = element.getAsJsonObject();
+                        UUID playerUuid = UUID.fromString(returnObj.get("uuid").getAsString());
+                        JsonArray itemsArray = returnObj.getAsJsonArray("items");
+                        List<ItemStack> items = new ArrayList<>();
+                        
+                        for (JsonElement itemElement : itemsArray) {
+                            try {
+                                String itemBase64 = itemElement.getAsString();
+                                byte[] data = Base64.getDecoder().decode(itemBase64);
+                                ByteArrayInputStream inputStream = new ByteArrayInputStream(data);
+                                try (BukkitObjectInputStream dataInput = new BukkitObjectInputStream(inputStream)) {
+                                    items.add((ItemStack) dataInput.readObject());
+                                }
+                            } catch (Exception e) {
+                                getLogger().warning("Failed to decode pending return item: " + e.getMessage());
+                            }
+                        }
+                        
+                        if (!items.isEmpty()) {
+                            pendingItemReturns.put(playerUuid, items);
+                        }
+                    }
+                }
+                getLogger().info("Loaded " + pendingItemReturns.size() + " pending item returns.");
+            } catch (Exception e) {
+                getLogger().log(Level.WARNING, "Failed to load pending returns", e);
+            }
+        }
+    }
+
+    private void savePendingReturns() {
+        File pendingFile = new File(getDataFolder(), "pending_returns.dat");
+        try {
+            JsonObject jsonObject = new JsonObject();
+            JsonArray returnsArray = new JsonArray();
+            
+            for (Map.Entry<UUID, List<ItemStack>> entry : pendingItemReturns.entrySet()) {
+                JsonObject returnObj = new JsonObject();
+                returnObj.addProperty("uuid", entry.getKey().toString());
+                
+                JsonArray itemsArray = new JsonArray();
+                for (ItemStack item : entry.getValue()) {
+                    try {
+                        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                        try (BukkitObjectOutputStream dataOutput = new BukkitObjectOutputStream(outputStream)) {
+                            dataOutput.writeObject(item);
+                        }
+                        itemsArray.add(Base64.getEncoder().encodeToString(outputStream.toByteArray()));
+                    } catch (Exception e) {
+                        getLogger().warning("Failed to encode pending return item: " + e.getMessage());
+                    }
+                }
+                
+                returnObj.add("items", itemsArray);
+                returnsArray.add(returnObj);
+            }
+            
+            jsonObject.add("returns", returnsArray);
+            
+            try (Writer writer = new FileWriter(pendingFile)) {
+                GSON.toJson(jsonObject, writer);
+                writer.flush();
+            }
+        } catch (IOException e) {
+            getLogger().log(Level.SEVERE, "Failed to save pending returns", e);
         }
     }
 
@@ -751,27 +833,36 @@ public class CoinShop extends JavaPlugin implements Listener {
             return false;
         }
         
-        if (!item.sellerUuid.equals(player.getUniqueId())) {
+        if (!item.sellerUuid.equals(player.getUniqueId()) && !player.hasPermission("coinshop.admin")) {
             player.sendMessage(ChatColor.RED + "This is not your item to cancel!");
             return false;
         }
 
         if (storeData.items.remove(item)) {
-            HashMap<Integer, ItemStack> leftover = player.getInventory().addItem(item.item.clone());
-            if (!leftover.isEmpty()) {
-                World world = player.getWorld();
-                Location loc = player.getLocation();
-                for (ItemStack drop : leftover.values()) {
-                    if (drop != null) {
-                        world.dropItemNaturally(loc, drop);
+            // Try to give items to seller if online
+            Player seller = Bukkit.getPlayer(item.sellerUuid);
+            if (seller != null && seller.isOnline()) {
+                HashMap<Integer, ItemStack> leftover = seller.getInventory().addItem(item.item.clone());
+                if (!leftover.isEmpty()) {
+                    World world = seller.getWorld();
+                    Location loc = seller.getLocation();
+                    for (ItemStack drop : leftover.values()) {
+                        if (drop != null) {
+                            world.dropItemNaturally(loc, drop);
+                        }
                     }
+                    seller.sendMessage(ChatColor.YELLOW + "Some items were dropped because your inventory was full!");
                 }
-                player.sendMessage(ChatColor.YELLOW + "Some items were dropped because your inventory was full!");
+                seller.sendMessage(ChatColor.GREEN + "Your item has been returned to you.");
+            } else {
+                // Store items for later return
+                pendingItemReturns.computeIfAbsent(item.sellerUuid, k -> new ArrayList<>())
+                        .add(item.item.clone());
+                savePendingReturns();
+                player.sendMessage(ChatColor.GREEN + "Item removed from shop. It will be returned when the seller comes online.");
             }
 
             saveStoreData();
-
-            player.sendMessage(ChatColor.GREEN + "Item removed from shop!");
             return true;
         }
 
@@ -779,11 +870,200 @@ public class CoinShop extends JavaPlugin implements Listener {
         return false;
     }
 
+    private void returnPendingItems(Player player) {
+        List<ItemStack> items = pendingItemReturns.remove(player.getUniqueId());
+        if (items != null && !items.isEmpty()) {
+            for (ItemStack item : items) {
+                HashMap<Integer, ItemStack> leftover = player.getInventory().addItem(item);
+                if (!leftover.isEmpty()) {
+                    World world = player.getWorld();
+                    Location loc = player.getLocation();
+                    for (ItemStack drop : leftover.values()) {
+                        if (drop != null) {
+                            world.dropItemNaturally(loc, drop);
+                        }
+                    }
+                }
+            }
+            player.sendMessage(ChatColor.GREEN + "You have received " + items.size() + 
+                    " item(s) that were removed from the shop while you were offline.");
+            savePendingReturns();
+        }
+    }
+
+    // ====================================================
+    // SHOP INVENTORY HOLDER
+    // ====================================================
+    public static class ShopInventoryHolder implements InventoryHolder {
+
+        public enum Type {
+            MAIN_MENU,
+            CATEGORIES_MENU,
+            CATEGORY_SHOP,
+            MY_SHOP,
+            GLOBAL_SHOP
+        }
+
+        private final Type type;
+        private final ItemCategory category;
+        private final int page;
+        private final UUID viewerUuid;
+
+        public ShopInventoryHolder(Type type, ItemCategory category, int page, UUID viewerUuid) {
+            this.type = type;
+            this.category = category;
+            this.page = page;
+            this.viewerUuid = viewerUuid;
+        }
+
+        @Override
+        public Inventory getInventory() {
+            return null;
+        }
+
+        public Type getType() {
+            return type;
+        }
+
+        public ItemCategory getCategory() {
+            return category;
+        }
+
+        public int getPage() {
+            return page;
+        }
+
+        public UUID getViewerUuid() {
+            return viewerUuid;
+        }
+    }
+
+    // ====================================================
+    // CATEGORY SYSTEM
+    // ====================================================
+    public enum ItemCategory {
+        ALL("All Items", Material.COMPASS, "All items in the shop"),
+        TOOLS("Tools", Material.DIAMOND_PICKAXE, "Pickaxes, axes, shovels, hoes"),
+        WEAPONS("Weapons", Material.DIAMOND_SWORD, "Swords, bows, arrows"),
+        ARMOR("Armor", Material.DIAMOND_CHESTPLATE, "Helmets, chestplates, leggings, boots"),
+        FOOD("Food", Material.COOKED_BEEF, "All types of food"),
+        BLOCKS("Blocks", Material.GRASS_BLOCK, "Building blocks"),
+        REDSTONE("Redstone", Material.REDSTONE, "Redstone components and mechanisms"),
+        POTIONS("Potions", Material.POTION, "Potions and brewing items"),
+        ENCHANTING("Enchanting", Material.ENCHANTING_TABLE, "Enchanting books and tables"),
+        TRANSPORTATION("Transportation", Material.MINECART, "Minecarts, rails, boats"),
+        DECORATION("Decoration", Material.PAINTING, "Decorative items"),
+        MISC("Miscellaneous", Material.CHEST, "Other items");
+
+        private final String displayName;
+        private final Material icon;
+        private final String description;
+
+        ItemCategory(String displayName, Material icon, String description) {
+            this.displayName = displayName;
+            this.icon = icon;
+            this.description = description;
+        }
+
+        public String getDisplayName() {
+            return displayName;
+        }
+
+        public Material getIcon() {
+            return icon;
+        }
+
+        public String getDescription() {
+            return description;
+        }
+
+        public static ItemCategory fromMaterial(Material material) {
+            String materialName = material.name();
+            
+            if (materialName.contains("PICKAXE") || materialName.contains("AXE") || 
+                materialName.contains("SHOVEL") || materialName.contains("HOE") ||
+                materialName.contains("FISHING_ROD") || materialName.contains("SHEARS") ||
+                materialName.contains("FLINT_AND_STEEL")) {
+                return TOOLS;
+            }
+            if (materialName.contains("SWORD") || materialName.contains("BOW") || 
+                materialName.contains("ARROW") || materialName.contains("TRIDENT") ||
+                materialName.contains("CROSSBOW") || materialName.contains("SHIELD") ||
+                materialName.contains("SPECTRAL_ARROW") || materialName.contains("TIPPED_ARROW")) {
+                return WEAPONS;
+            }
+            if (materialName.contains("HELMET") || materialName.contains("CHESTPLATE") || 
+                materialName.contains("LEGGINGS") || materialName.contains("BOOTS") ||
+                materialName.contains("TURTLE_HELMET") || materialName.contains("ELYTRA") ||
+                materialName.contains("HORSE_ARMOR")) {
+                return ARMOR;
+            }
+            if (material.isEdible() || material == Material.MUSHROOM_STEW || 
+                material == Material.RABBIT_STEW || material == Material.BEETROOT_SOUP ||
+                material == Material.SUSPICIOUS_STEW || material == Material.HONEY_BOTTLE) {
+                return FOOD;
+            }
+            if (material.isBlock()) {
+                if (materialName.contains("REDSTONE") || materialName.contains("PISTON") || 
+                    materialName.contains("REPEATER") || materialName.contains("COMPARATOR") ||
+                    materialName.contains("OBSERVER") || materialName.contains("HOPPER") ||
+                    materialName.contains("DROPPER") || materialName.contains("DISPENSER") ||
+                    materialName.contains("RAIL") || materialName.contains("DETECTOR") ||
+                    materialName.contains("TARGET") || materialName.contains("DAYLIGHT") ||
+                    materialName.contains("LEVER") || materialName.contains("BUTTON") ||
+                    materialName.contains("PRESSURE_PLATE") || materialName.contains("TRIPWIRE") ||
+                    materialName.contains("LECTERN") || materialName.contains("BELL") ||
+                    materialName.contains("LANTERN") || materialName.contains("CAMPFIRE")) {
+                    return REDSTONE;
+                }
+                return BLOCKS;
+            }
+            if (materialName.contains("POTION") || materialName.contains("BREWING") || 
+                materialName.contains("NETHER_WART") || materialName.contains("GLASS_BOTTLE") ||
+                materialName.contains("DRAGON_BREATH") || materialName.contains("GUNPOWDER") ||
+                materialName.contains("BLAZE_POWDER") || materialName.contains("MAGMA_CREAM") ||
+                materialName.contains("FERMENTED_SPIDER_EYE") || materialName.contains("GLISTERING_MELON")) {
+                return POTIONS;
+            }
+            if (materialName.contains("ENCHANT") || materialName.contains("BOOKSHELF") || 
+                materialName.contains("EXPERIENCE") || materialName.contains("LAPIS") ||
+                materialName.contains("ANVIL") || materialName.contains("GRINDSTONE") ||
+                materialName.contains("STONECUTTER") || materialName.contains("CARTOGRAPHY") ||
+                materialName.contains("FLETCHING") || materialName.contains("SMITHING") ||
+                materialName.contains("END_CRYSTAL") || materialName.contains("ENDER_EYE")) {
+                return ENCHANTING;
+            }
+            if (materialName.contains("MINECART") || materialName.contains("BOAT") || 
+                materialName.contains("SADDLE") || materialName.contains("RAIL") ||
+                materialName.contains("CARROT_ON_A_STICK") || materialName.contains("WARPED_FUNGUS_ON_A_STICK")) {
+                return TRANSPORTATION;
+            }
+            if (materialName.contains("PAINTING") || materialName.contains("FLOWER") || 
+                materialName.contains("SAPLING") || materialName.contains("BANNER") ||
+                materialName.contains("CARPET") || materialName.contains("WOOL") ||
+                materialName.contains("GLASS_PANE") || materialName.contains("IRON_BARS") ||
+                materialName.contains("VINE") || materialName.contains("LILY_PAD") ||
+                materialName.contains("SEAGRASS") || materialName.contains("KELP") ||
+                materialName.contains("CANDLE") || materialName.contains("AMETHYST")) {
+                return DECORATION;
+            }
+            
+            return MISC;
+        }
+    }
+
     // ====================================================
     // GUI BUILDERS
     // ====================================================
     private Inventory buildMainMenu(Player player) {
-        Inventory inv = Bukkit.createInventory(null, 27, ChatColor.BLUE + "CoinShop");
+        ShopInventoryHolder holder = new ShopInventoryHolder(
+            ShopInventoryHolder.Type.MAIN_MENU, 
+            null, 
+            0, 
+            player.getUniqueId()
+        );
+        
+        Inventory inv = Bukkit.createInventory(holder, 27, ChatColor.BLUE + "CoinShop");
 
         ItemStack myShop = new ItemStack(Material.CHEST);
         ItemMeta myShopMeta = myShop.getItemMeta();
@@ -794,6 +1074,16 @@ public class CoinShop extends JavaPlugin implements Listener {
         ));
         myShop.setItemMeta(myShopMeta);
         inv.setItem(11, myShop);
+
+        ItemStack categories = new ItemStack(Material.BOOKSHELF);
+        ItemMeta categoriesMeta = categories.getItemMeta();
+        categoriesMeta.setDisplayName(ChatColor.GOLD + "Categories");
+        categoriesMeta.setLore(Arrays.asList(
+                ChatColor.GRAY + "Browse items by category",
+                ChatColor.GRAY + "Tools, Food, Blocks, etc."
+        ));
+        categories.setItemMeta(categoriesMeta);
+        inv.setItem(13, categories);
 
         ItemStack globalShop = new ItemStack(Material.EMERALD);
         ItemMeta globalMeta = globalShop.getItemMeta();
@@ -819,13 +1109,94 @@ public class CoinShop extends JavaPlugin implements Listener {
         return inv;
     }
 
+    private Inventory buildCategoriesMenu(Player player) {
+        ShopInventoryHolder holder = new ShopInventoryHolder(
+            ShopInventoryHolder.Type.CATEGORIES_MENU, 
+            null, 
+            0, 
+            player.getUniqueId()
+        );
+        
+        Inventory inv = Bukkit.createInventory(holder, 54, ChatColor.GOLD + "Shop Categories");
+
+        int slot = 0;
+        for (ItemCategory category : ItemCategory.values()) {
+            ItemStack categoryItem = new ItemStack(category.getIcon());
+            ItemMeta meta = categoryItem.getItemMeta();
+            meta.setDisplayName(ChatColor.GOLD + category.getDisplayName());
+            
+            List<String> lore = new ArrayList<>();
+            lore.add(ChatColor.GRAY + category.getDescription());
+            
+            long itemCount = storeData.items.stream()
+                    .filter(item -> item != null && item.item != null)
+                    .filter(item -> category == ItemCategory.ALL || 
+                           ItemCategory.fromMaterial(item.item.getType()) == category)
+                    .count();
+            
+            lore.add(ChatColor.GREEN + "Items: " + ChatColor.WHITE + itemCount);
+            meta.setLore(lore);
+            
+            categoryItem.setItemMeta(meta);
+            inv.setItem(slot++, categoryItem);
+            
+            if (slot % 9 == 0) slot++;
+        }
+
+        ItemStack back = new ItemStack(Material.BARRIER);
+        ItemMeta backMeta = back.getItemMeta();
+        backMeta.setDisplayName(ChatColor.RED + "Back to Main Menu");
+        back.setItemMeta(backMeta);
+        inv.setItem(49, back);
+
+        ItemStack filler = new ItemStack(Material.GRAY_STAINED_GLASS_PANE);
+        ItemMeta fillerMeta = filler.getItemMeta();
+        fillerMeta.setDisplayName(" ");
+        filler.setItemMeta(fillerMeta);
+
+        for (int i = 45; i < 54; i++) {
+            if (inv.getItem(i) == null) {
+                inv.setItem(i, filler);
+            }
+        }
+
+        return inv;
+    }
+
+    private Inventory buildCategoryShopMenu(Player player, ItemCategory category, int page) {
+        List<ShopItem> categoryItems = storeData.items.stream()
+                .filter(item -> item != null && item.item != null)
+                .filter(item -> category == ItemCategory.ALL || 
+                       ItemCategory.fromMaterial(item.item.getType()) == category)
+                .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
+                .collect(Collectors.toList());
+
+        ShopInventoryHolder holder = new ShopInventoryHolder(
+            ShopInventoryHolder.Type.CATEGORY_SHOP, 
+            category, 
+            page, 
+            player.getUniqueId()
+        );
+        
+        String title = ChatColor.GOLD + category.getDisplayName() + " - Page " + (page + 1);
+        return buildShopInventory(categoryItems, page, title, holder, false);
+    }
+
     private Inventory buildMyShopMenu(Player player, int page) {
         List<ShopItem> myItems = storeData.items.stream()
                 .filter(item -> item != null && item.sellerUuid != null && item.sellerUuid.equals(player.getUniqueId()))
                 .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
                 .collect(Collectors.toList());
 
-        return buildShopInventory(myItems, page, ChatColor.GREEN + "My Shop - Page " + (page + 1), true);
+        ShopInventoryHolder holder = new ShopInventoryHolder(
+            ShopInventoryHolder.Type.MY_SHOP, 
+            null, 
+            page, 
+            player.getUniqueId()
+        );
+        
+        String title = ChatColor.GREEN + "My Shop - Page " + (page + 1);
+        return buildShopInventory(myItems, page, title, holder, true);
     }
 
     private Inventory buildGlobalShopMenu(Player player, int page) {
@@ -834,15 +1205,24 @@ public class CoinShop extends JavaPlugin implements Listener {
                 .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
                 .collect(Collectors.toList());
 
-        return buildShopInventory(allItems, page, ChatColor.GREEN + "Global Shop - Page " + (page + 1), false);
+        ShopInventoryHolder holder = new ShopInventoryHolder(
+            ShopInventoryHolder.Type.GLOBAL_SHOP, 
+            null, 
+            page, 
+            player.getUniqueId()
+        );
+        
+        String title = ChatColor.GREEN + "Global Shop - Page " + (page + 1);
+        return buildShopInventory(allItems, page, title, holder, false);
     }
 
-    private Inventory buildShopInventory(List<ShopItem> items, int page, String title, boolean isMyShop) {
+    private Inventory buildShopInventory(List<ShopItem> items, int page, String title, 
+                                          ShopInventoryHolder holder, boolean isMyShop) {
         int itemsPerPage = 45;
         int totalPages = (int) Math.ceil(items.size() / (double) itemsPerPage);
         page = Math.max(0, Math.min(page, totalPages - 1));
 
-        Inventory inv = Bukkit.createInventory(null, 54, title);
+        Inventory inv = Bukkit.createInventory(holder, 54, title);
 
         int start = page * itemsPerPage;
         int end = Math.min(start + itemsPerPage, items.size());
@@ -866,6 +1246,9 @@ public class CoinShop extends JavaPlugin implements Listener {
             if (isMyShop) {
                 lore.add("");
                 lore.add(ChatColor.RED + "Click to cancel listing");
+            } else {
+                lore.add("");
+                lore.add(ChatColor.GREEN + "Click to purchase");
             }
             meta.setLore(lore);
             displayItem.setItemMeta(meta);
@@ -925,125 +1308,231 @@ public class CoinShop extends JavaPlugin implements Listener {
         return formatted;
     }
 
+    private boolean isAdminWithCreative(Player player) {
+        return player.hasPermission("coinshop.admin") && player.getGameMode() == GameMode.CREATIVE;
+    }
+
     // ====================================================
     // EVENT LISTENERS
     // ====================================================
     @EventHandler
     public void onInventoryClick(InventoryClickEvent event) {
-        if (!(event.getWhoClicked() instanceof Player)) return;
-        Player player = (Player) event.getWhoClicked();
-        String title = event.getView().getTitle();
-
-        if (title.contains("CoinShop") || title.contains("Shop")) {
+        if (!(event.getWhoClicked() instanceof Player player)) return;
+        
+        Inventory inv = event.getInventory();
+        if (!(inv.getHolder() instanceof ShopInventoryHolder holder)) return;
+        
+        // Verificar se o holder corresponde ao jogador atual
+        if (!holder.getViewerUuid().equals(player.getUniqueId())) {
             event.setCancelled(true);
+            player.closeInventory();
+            player.sendMessage(ChatColor.RED + "This inventory does not belong to you!");
+            return;
+        }
 
-            if (event.getCurrentItem() == null || !event.getCurrentItem().hasItemMeta()) return;
+        event.setCancelled(true);
 
-            ItemStack clickedItem = event.getCurrentItem();
-            String displayName = clickedItem.getItemMeta().getDisplayName();
-            Material type = clickedItem.getType();
+        // Allow admins in creative to cancel items with middle click
+        if (isAdminWithCreative(player) && event.getClick() == ClickType.MIDDLE) {
+            handleAdminCancel(player, event.getCurrentItem(), holder);
+            return;
+        }
 
-            if (title.equals(ChatColor.BLUE + "CoinShop")) {
-                if (event.getSlot() == 11) {
+        if (event.getCurrentItem() == null || event.getCurrentItem().getType() == Material.AIR) return;
+
+        int slot = event.getSlot();
+        ShopInventoryHolder.Type type = holder.getType();
+        int page = holder.getPage();
+
+        switch (type) {
+            case MAIN_MENU:
+                if (slot == 11) {
                     player.openInventory(buildMyShopMenu(player, 0));
-                } else if (event.getSlot() == 15) {
+                } else if (slot == 13) {
+                    player.openInventory(buildCategoriesMenu(player));
+                } else if (slot == 15) {
                     player.openInventory(buildGlobalShopMenu(player, 0));
                 }
-                return;
-            }
+                break;
 
-            boolean isMyShop = title.startsWith(ChatColor.GREEN + "My Shop");
-            boolean isGlobalShop = title.startsWith(ChatColor.GREEN + "Global Shop");
-
-            if (isMyShop || isGlobalShop) {
-                if (event.getSlot() == 49 && type == Material.BARRIER && 
-                    displayName.equals(ChatColor.RED + "Back to Main Menu")) {
+            case CATEGORIES_MENU:
+                if (slot == 49) {
                     player.openInventory(buildMainMenu(player));
                     return;
                 }
-
-                int currentPage = extractPageNumber(title);
-
-                if (event.getSlot() == 45 && type == Material.ARROW && 
-                    displayName.equals(ChatColor.GREEN + "Previous Page")) {
-                    if (currentPage > 0) {
-                        if (isMyShop) {
-                            player.openInventory(buildMyShopMenu(player, currentPage - 1));
-                        } else {
-                            player.openInventory(buildGlobalShopMenu(player, currentPage - 1));
-                        }
-                    }
-                    return;
+                if (slot < ItemCategory.values().length) {
+                    ItemCategory category = ItemCategory.values()[slot];
+                    player.openInventory(buildCategoryShopMenu(player, category, 0));
                 }
+                break;
 
-                if (event.getSlot() == 53 && type == Material.ARROW && 
-                    displayName.equals(ChatColor.GREEN + "Next Page")) {
-                    if (isMyShop) {
-                        player.openInventory(buildMyShopMenu(player, currentPage + 1));
-                    } else {
-                        player.openInventory(buildGlobalShopMenu(player, currentPage + 1));
-                    }
-                    return;
-                }
+            case CATEGORY_SHOP:
+                handlePagedShopClick(player, holder.getCategory(), page, slot, false);
+                break;
 
-                if (event.getSlot() < 45 && type != Material.AIR && 
-                    !displayName.equals(" ") && 
-                    type != Material.GRAY_STAINED_GLASS_PANE) {
-                    
-                    handleItemClick(player, event.getSlot(), clickedItem, title, isMyShop);
-                }
-            }
+            case MY_SHOP:
+                handlePagedShopClick(player, null, page, slot, true);
+                break;
+
+            case GLOBAL_SHOP:
+                handlePagedShopClick(player, null, page, slot, false);
+                break;
         }
     }
 
-    private void handleItemClick(Player player, int slot, ItemStack clickedItem, String title, boolean isMyShop) {
-        if (player == null) return;
-        
-        List<ShopItem> items;
-        int page = extractPageNumber(title);
-
-        if (isMyShop) {
-            items = storeData.items.stream()
-                    .filter(item -> item != null && item.sellerUuid != null && item.sellerUuid.equals(player.getUniqueId()))
-                    .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
-                    .collect(Collectors.toList());
-        } else {
-            items = storeData.items.stream()
-                    .filter(Objects::nonNull)
-                    .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
-                    .collect(Collectors.toList());
+    private void handlePagedShopClick(Player player, ItemCategory category, int page, int slot, boolean isMyShop) {
+        if (slot == 49) {
+            player.openInventory(buildMainMenu(player));
+            return;
         }
+
+        if (slot == 45 && page > 0) {
+            reopenPage(player, category, page - 1, isMyShop);
+            return;
+        }
+
+        if (slot == 53) {
+            reopenPage(player, category, page + 1, isMyShop);
+            return;
+        }
+
+        if (slot >= 45) return;
+
+        List<ShopItem> items = getFilteredItems(player, category, isMyShop);
 
         int index = page * 45 + slot;
-        if (index < items.size()) {
-            ShopItem shopItem = items.get(index);
-            if (shopItem == null) return;
+        if (index >= items.size()) return;
 
-            if (isMyShop) {
-                cancelListing(player, shopItem);
-                player.openInventory(buildMyShopMenu(player, page));
-            } else {
-                purchaseItem(player, shopItem);
-                player.openInventory(buildGlobalShopMenu(player, page));
+        ShopItem shopItem = items.get(index);
+
+        if (isMyShop) {
+            cancelListing(player, shopItem);
+            reopenPage(player, category, page, true);
+        } else {
+            purchaseItem(player, shopItem);
+        }
+    }
+
+    private void reopenPage(Player player, ItemCategory category, int page, boolean isMyShop) {
+        if (isMyShop) {
+            player.openInventory(buildMyShopMenu(player, page));
+        } else if (category != null) {
+            player.openInventory(buildCategoryShopMenu(player, category, page));
+        } else {
+            player.openInventory(buildGlobalShopMenu(player, page));
+        }
+    }
+
+    private List<ShopItem> getFilteredItems(Player player, ItemCategory category, boolean isMyShop) {
+        if (isMyShop) {
+            return storeData.items.stream()
+                    .filter(item -> item != null && item.sellerUuid != null && 
+                           item.sellerUuid.equals(player.getUniqueId()))
+                    .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
+                    .collect(Collectors.toList());
+        }
+
+        if (category != null) {
+            return storeData.items.stream()
+                    .filter(item -> item != null && item.item != null)
+                    .filter(item -> category == ItemCategory.ALL || 
+                           ItemCategory.fromMaterial(item.item.getType()) == category)
+                    .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
+                    .collect(Collectors.toList());
+        }
+
+        return storeData.items.stream()
+                .filter(Objects::nonNull)
+                .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
+                .collect(Collectors.toList());
+    }
+
+    private void handleAdminCancel(Player admin, ItemStack clickedItem, ShopInventoryHolder holder) {
+        if (clickedItem == null || clickedItem.getType() == Material.AIR || 
+            !clickedItem.hasItemMeta() || clickedItem.getItemMeta().getDisplayName().equals(" ")) {
+            return;
+        }
+
+        List<ShopItem> items = getFilteredItems(admin, holder.getCategory(), 
+                                                holder.getType() == ShopInventoryHolder.Type.MY_SHOP);
+        
+        int page = holder.getPage();
+        int slot = -1;
+        
+        // Tentar encontrar o item baseado no preço e nome do vendedor
+        List<String> lore = clickedItem.getItemMeta().getLore();
+        if (lore != null) {
+            String priceStr = null;
+            String sellerStr = null;
+            
+            for (String line : lore) {
+                String cleanLine = ChatColor.stripColor(line);
+                if (cleanLine.contains("Price:")) {
+                    priceStr = cleanLine.replace("Price:", "").trim();
+                } else if (cleanLine.contains("Seller:")) {
+                    sellerStr = cleanLine.replace("Seller:", "").trim();
+                }
+            }
+            
+            if (priceStr != null) {
+                for (int i = 0; i < items.size(); i++) {
+                    ShopItem item = items.get(i);
+                    if (formatCoin(item.price).equals(priceStr)) {
+                        if (sellerStr == null || item.sellerShopName.equals(sellerStr)) {
+                            slot = i;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (slot >= 0) {
+            int index = page * 45 + (slot % 45);
+            if (index < items.size()) {
+                ShopItem itemToCancel = items.get(index);
+                cancelListing(admin, itemToCancel);
+                admin.sendMessage(ChatColor.GREEN + "Item cancelled by admin.");
+                reopenPage(admin, holder.getCategory(), page, 
+                          holder.getType() == ShopInventoryHolder.Type.MY_SHOP);
             }
         }
     }
 
-    private int extractPageNumber(String title) {
-        try {
-            String[] parts = title.split("Page ");
-            if (parts.length > 1) {
-                return Integer.parseInt(parts[1].trim()) - 1;
-            }
-        } catch (Exception ignored) {}
-        return 0;
+    @EventHandler
+    public void onInventoryDrag(InventoryDragEvent event) {
+        if (event.getInventory().getHolder() instanceof ShopInventoryHolder) {
+            event.setCancelled(true);
+        }
+    }
+
+    @EventHandler
+    public void onInventoryOpen(InventoryOpenEvent event) {
+        if (event.getInventory().getHolder() instanceof ShopInventoryHolder) {
+            // Atualizar última ação do jogador
+            Player player = (Player) event.getPlayer();
+            playerSessions.put(player.getUniqueId(), new PlayerSession(player.getUniqueId()));
+        }
+    }
+
+    @EventHandler
+    public void onInventoryClose(InventoryCloseEvent event) {
+        if (event.getInventory().getHolder() instanceof ShopInventoryHolder) {
+            // Limpar sessão se necessário
+            Player player = (Player) event.getPlayer();
+            playerSessions.remove(player.getUniqueId());
+        }
     }
 
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
-        if (event.getPlayer() != null) {
-            playerSessions.remove(event.getPlayer().getUniqueId());
-        }
+        playerSessions.remove(event.getPlayer().getUniqueId());
+    }
+
+    @EventHandler
+    public void onPlayerJoin(PlayerJoinEvent event) {
+        Player player = event.getPlayer();
+        returnPendingItems(player);
     }
 
     // ====================================================
@@ -1082,14 +1571,6 @@ public class CoinShop extends JavaPlugin implements Listener {
                     }
                     loadConfig();
                     player.sendMessage(ChatColor.GREEN + "CoinShop configuration reloaded!");
-                    break;
-
-                case "open":
-                    if (args.length < 2) {
-                        player.sendMessage(ChatColor.RED + "Usage: /cshop open <shopname>");
-                        return true;
-                    }
-                    openShopByName(player, args[1]);
                     break;
 
                 case "sell":
@@ -1182,75 +1663,6 @@ public class CoinShop extends JavaPlugin implements Listener {
             createListing(player, sellItem, price);
         }
 
-        private void openShopByName(Player player, String shopName) {
-            if (player == null || shopName == null) return;
-            
-            UUID ownerUuid = null;
-            File[] userFiles = usersFolder.listFiles((dir, name) -> name.endsWith(".yml"));
-            if (userFiles != null) {
-                for (File file : userFiles) {
-                    YamlConfiguration yamlConfig = YamlConfiguration.loadConfiguration(file);
-                    String name = yamlConfig.getString("Name", "");
-                    if (name.equalsIgnoreCase(shopName)) {
-                        try {
-                            ownerUuid = UUID.fromString(file.getName().replace(".yml", ""));
-                            break;
-                        } catch (IllegalArgumentException ignored) {}
-                    }
-                }
-            }
-
-            if (ownerUuid == null) {
-                player.sendMessage(ChatColor.RED + "Shop not found: " + shopName);
-                return;
-            }
-
-            UUID finalOwnerUuid = ownerUuid;
-            List<ShopItem> shopItems = storeData.items.stream()
-                    .filter(item -> item != null && item.sellerUuid != null && item.sellerUuid.equals(finalOwnerUuid))
-                    .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
-                    .collect(Collectors.toList());
-
-            Inventory inv = Bukkit.createInventory(null, 54,
-                    ChatColor.GREEN + shopName + "'s Shop - Page 1");
-
-            int slot = 0;
-            for (ShopItem item : shopItems) {
-                if (slot >= 45 || item == null || item.item == null) break;
-
-                ItemStack displayItem = item.item.clone();
-                ItemMeta meta = displayItem.getItemMeta();
-                List<String> lore = meta.hasLore() ? meta.getLore() : new ArrayList<>();
-                lore.add("");
-                lore.add(ChatColor.GOLD + "Price: " + ChatColor.WHITE + formatCoin(item.price));
-                if (taxRate > 0) {
-                    BigDecimal total = item.price.add(item.price.multiply(BigDecimal.valueOf(taxRate)))
-                            .setScale(8, RoundingMode.DOWN);
-                    lore.add(ChatColor.GRAY + "Total with tax: " + ChatColor.WHITE + formatCoin(total));
-                }
-                meta.setLore(lore);
-                displayItem.setItemMeta(meta);
-                inv.setItem(slot++, displayItem);
-            }
-
-            ItemStack back = new ItemStack(Material.BARRIER);
-            ItemMeta backMeta = back.getItemMeta();
-            backMeta.setDisplayName(ChatColor.RED + "Back to Main Menu");
-            back.setItemMeta(backMeta);
-            inv.setItem(49, back);
-
-            ItemStack filler = new ItemStack(Material.GRAY_STAINED_GLASS_PANE);
-            ItemMeta fillerMeta = filler.getItemMeta();
-            fillerMeta.setDisplayName(" ");
-            filler.setItemMeta(fillerMeta);
-
-            for (int i = slot; i < 45; i++) {
-                inv.setItem(i, filler);
-            }
-
-            player.openInventory(inv);
-        }
-
         private void checkPlayerBalanceCommand(Player player) {
             if (player == null) return;
             
@@ -1260,7 +1672,6 @@ public class CoinShop extends JavaPlugin implements Listener {
                 return;
             }
 
-            // Use getPlayerBalanceByUUID instead of checkPlayerBalance
             getPlayerBalanceByUUID(player.getUniqueId(), new BalanceCheckCallback() {
                 @Override
                 public void onSuccess(BigDecimal balance) {
@@ -1281,7 +1692,6 @@ public class CoinShop extends JavaPlugin implements Listener {
 
             if (args.length == 1) {
                 completions.add("reload");
-                completions.add("open");
                 completions.add("sell");
                 completions.add("cancel");
                 completions.add("name");
@@ -1289,19 +1699,6 @@ public class CoinShop extends JavaPlugin implements Listener {
                 return completions.stream()
                         .filter(s -> s.startsWith(args[0].toLowerCase()))
                         .collect(Collectors.toList());
-            }
-
-            if (args.length == 2 && args[0].equalsIgnoreCase("open")) {
-                File[] userFiles = usersFolder.listFiles((dir, name) -> name.endsWith(".yml"));
-                if (userFiles != null) {
-                    for (File file : userFiles) {
-                        YamlConfiguration yamlConfig = YamlConfiguration.loadConfiguration(file);
-                        String name = yamlConfig.getString("Name", "");
-                        if (name.toLowerCase().startsWith(args[1].toLowerCase())) {
-                            completions.add(name);
-                        }
-                    }
-                }
             }
 
             return completions;
