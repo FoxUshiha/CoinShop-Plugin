@@ -3,6 +3,11 @@ Minecraft Coin Shop Plugin that uses the Coin API to buy and sell itens between 
 
 Soft depends on vault.
 
+Depends on CoinCard Plugin:
+
+https://www.spigotmc.org/resources/coin-card.129770/
+
+
 API 1.20+
 
 Coin API> https://bank.foxsrv.net/
@@ -18,8 +23,6 @@ Commands:
 /cshop name - renames your store
 
 /cshop cancel - cancel items
-
-/cshop card - defines your card id to buy and sell items
 
 /cshop open - opens a specific player shop
 
