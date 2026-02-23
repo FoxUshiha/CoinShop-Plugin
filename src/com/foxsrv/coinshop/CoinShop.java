@@ -1,5 +1,8 @@
 package com.foxsrv.coinshop;
 
+import com.foxsrv.coincard.CoinCardPlugin.CoinCardAPI;
+import com.foxsrv.coincard.CoinCardPlugin.TransferCallback;
+import com.foxsrv.coincard.CoinCardPlugin.BalanceCallback;
 import com.google.gson.*;
 import org.bukkit.*;
 import org.bukkit.command.*;
@@ -10,6 +13,7 @@ import org.bukkit.event.inventory.*;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.inventory.*;
 import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.plugin.RegisteredServiceProvider;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.scheduler.BukkitTask;
@@ -19,9 +23,6 @@ import org.bukkit.util.io.BukkitObjectOutputStream;
 import java.io.*;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.nio.charset.StandardCharsets;
 import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
 import java.util.*;
@@ -57,8 +58,10 @@ public class CoinShop extends JavaPlugin implements Listener {
     private double taxRate;
     private BigDecimal minPrice;
     private BigDecimal maxPrice;
-    private String apiBaseUrl;
     private long cooldownMs;
+
+    // CoinCard API
+    private CoinCardAPI coinCardAPI;
 
     // Transaction queue
     private final Queue<Transaction> transactionQueue = new ConcurrentLinkedQueue<>();
@@ -74,6 +77,13 @@ public class CoinShop extends JavaPlugin implements Listener {
     // ====================================================
     @Override
     public void onEnable() {
+        // Check if CoinCard is installed
+        if (!setupCoinCardAPI()) {
+            getLogger().severe("CoinCard plugin not found! Disabling CoinShop...");
+            getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
+
         saveDefaultConfig();
         
         if (!new File(getDataFolder(), "config.yml").exists()) {
@@ -96,7 +106,7 @@ public class CoinShop extends JavaPlugin implements Listener {
         COIN_FORMAT.setMinimumFractionDigits(0);
         COIN_FORMAT.setMaximumFractionDigits(8);
 
-        getLogger().info("CoinShop enabled successfully!");
+        getLogger().info("CoinShop v" + getDescription().getVersion() + " enabled successfully with CoinCard integration!");
         getLogger().info("Data folder: " + getDataFolder().getAbsolutePath());
     }
 
@@ -110,6 +120,26 @@ public class CoinShop extends JavaPlugin implements Listener {
     }
 
     // ====================================================
+    // COINCARD API SETUP
+    // ====================================================
+    private boolean setupCoinCardAPI() {
+        try {
+            RegisteredServiceProvider<CoinCardAPI> provider = 
+                getServer().getServicesManager().getRegistration(CoinCardAPI.class);
+
+            if (provider == null) {
+                return false;
+            }
+
+            coinCardAPI = provider.getProvider();
+            return coinCardAPI != null;
+        } catch (Exception e) {
+            getLogger().severe("Failed to setup CoinCard API: " + e.getMessage());
+            return false;
+        }
+    }
+
+    // ====================================================
     // CONFIGURATION
     // ====================================================
     private void loadConfig() {
@@ -120,7 +150,6 @@ public class CoinShop extends JavaPlugin implements Listener {
         config.addDefault("Tax", 0.1);
         config.addDefault("Min", 0.00000001);
         config.addDefault("Max", 1000.0);
-        config.addDefault("API", "https://bank.foxsrv.net");
         config.addDefault("Cooldown", 1000);
         config.options().copyDefaults(true);
         saveConfig();
@@ -129,7 +158,6 @@ public class CoinShop extends JavaPlugin implements Listener {
         taxRate = config.getDouble("Tax", 0.1);
         minPrice = BigDecimal.valueOf(config.getDouble("Min", 0.00000001));
         maxPrice = BigDecimal.valueOf(config.getDouble("Max", 1000.0));
-        apiBaseUrl = config.getString("API", "https://bank.foxsrv.net").replaceAll("/$", "");
         cooldownMs = config.getLong("Cooldown", 1000);
     }
 
@@ -177,7 +205,18 @@ public class CoinShop extends JavaPlugin implements Listener {
                         JsonObject itemObj = element.getAsJsonObject();
                         
                         String transactionId = itemObj.has("transactionId") ? itemObj.get("transactionId").getAsString() : UUID.randomUUID().toString();
-                        UUID sellerUuid = itemObj.has("sellerUuid") ? UUID.fromString(itemObj.get("sellerUuid").getAsString()) : null;
+                        
+                        // Handle potential null UUID
+                        UUID sellerUuid = null;
+                        if (itemObj.has("sellerUuid") && !itemObj.get("sellerUuid").isJsonNull()) {
+                            try {
+                                sellerUuid = UUID.fromString(itemObj.get("sellerUuid").getAsString());
+                            } catch (IllegalArgumentException e) {
+                                getLogger().warning("Invalid seller UUID in store data");
+                                continue;
+                            }
+                        }
+                        
                         String sellerCardId = itemObj.has("sellerCardId") ? itemObj.get("sellerCardId").getAsString() : "";
                         String sellerName = itemObj.has("sellerName") ? itemObj.get("sellerName").getAsString() : "";
                         String sellerShopName = itemObj.has("sellerShopName") ? itemObj.get("sellerShopName").getAsString() : "";
@@ -239,7 +278,9 @@ public class CoinShop extends JavaPlugin implements Listener {
             for (ShopItem shopItem : storeData.items) {
                 JsonObject itemObj = new JsonObject();
                 itemObj.addProperty("transactionId", shopItem.transactionId);
-                itemObj.addProperty("sellerUuid", shopItem.sellerUuid.toString());
+                if (shopItem.sellerUuid != null) {
+                    itemObj.addProperty("sellerUuid", shopItem.sellerUuid.toString());
+                }
                 itemObj.addProperty("sellerCardId", shopItem.sellerCardId);
                 itemObj.addProperty("sellerName", shopItem.sellerName);
                 itemObj.addProperty("sellerShopName", shopItem.sellerShopName);
@@ -275,6 +316,10 @@ public class CoinShop extends JavaPlugin implements Listener {
     // PLAYER DATA
     // ====================================================
     private PlayerData getPlayerData(UUID uuid) {
+        if (uuid == null) {
+            return null;
+        }
+        
         File playerFile = new File(usersFolder, uuid.toString() + ".yml");
         YamlConfiguration yamlConfig = YamlConfiguration.loadConfiguration(playerFile);
 
@@ -290,6 +335,10 @@ public class CoinShop extends JavaPlugin implements Listener {
     }
 
     private void savePlayerData(PlayerData data) {
+        if (data == null || data.uuid == null) {
+            return;
+        }
+        
         try {
             if (!usersFolder.exists()) {
                 usersFolder.mkdirs();
@@ -305,89 +354,85 @@ public class CoinShop extends JavaPlugin implements Listener {
     }
 
     // ====================================================
-    // API COMMUNICATION
+    // COINCARD API COMMUNICATION
     // ====================================================
-    private CompletableFuture<ApiResponse> transferBetweenCards(String fromCard, String toCard, BigDecimal amount) {
-        CompletableFuture<ApiResponse> future = new CompletableFuture<>();
-
-        new BukkitRunnable() {
-            @Override
-            public void run() {
-                try {
-                    String formattedAmount = formatCoinForApi(amount);
-
-                    URL url = new URL(apiBaseUrl + "/api/card/pay");
-                    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-                    conn.setRequestMethod("POST");
-                    conn.setRequestProperty("Content-Type", "application/json");
-                    conn.setRequestProperty("Accept", "application/json");
-                    conn.setDoOutput(true);
-                    conn.setConnectTimeout(10000);
-                    conn.setReadTimeout(30000);
-
-                    JsonObject requestBody = new JsonObject();
-                    requestBody.addProperty("fromCard", fromCard);
-                    requestBody.addProperty("toCard", toCard);
-                    requestBody.addProperty("amount", formattedAmount);
-
-                    String jsonBody = GSON.toJson(requestBody);
-                    
-                    try (OutputStream os = conn.getOutputStream()) {
-                        os.write(jsonBody.getBytes(StandardCharsets.UTF_8));
-                    }
-
-                    int responseCode = conn.getResponseCode();
-                    StringBuilder response = new StringBuilder();
-
-                    try (BufferedReader br = new BufferedReader(
-                            new InputStreamReader(
-                                    responseCode >= 400 ? conn.getErrorStream() : conn.getInputStream(),
-                                    StandardCharsets.UTF_8))) {
-                        String line;
-                        while ((line = br.readLine()) != null) {
-                            response.append(line);
-                        }
-                    }
-
-                    ApiResponse apiResponse;
-                    if (responseCode == 200) {
-                        try {
-                            JsonObject json = JsonParser.parseString(response.toString()).getAsJsonObject();
-                            boolean success = json.has("success") && json.get("success").getAsBoolean();
-
-                            if (success) {
-                                String txId = json.has("txId") ? json.get("txId").getAsString() : null;
-                                apiResponse = new ApiResponse(true, txId, null);
-                            } else {
-                                String error = json.has("error") ? json.get("error").getAsString() : "Unknown error";
-                                apiResponse = new ApiResponse(false, null, error);
-                            }
-                        } catch (Exception e) {
-                            apiResponse = new ApiResponse(false, null, "Invalid JSON response: " + response);
-                        }
-                    } else {
-                        apiResponse = new ApiResponse(false, null, "HTTP " + responseCode + ": " + response);
-                    }
-
-                    future.complete(apiResponse);
-                } catch (Exception e) {
-                    future.completeExceptionally(e);
-                }
+    private void transferWithCoinCard(String fromCard, String toCard, BigDecimal amount, 
+                                       Transaction transaction, PendingPurchase purchase) {
+        if (fromCard == null || toCard == null || amount == null || transaction == null || purchase == null) {
+            getLogger().warning("Invalid parameters for transfer");
+            if (transaction != null && purchase != null) {
+                handleFailedTransaction(transaction, purchase, "Invalid transfer parameters");
             }
-        }.runTaskAsynchronously(this);
+            return;
+        }
+        
+        double amountDouble = amount.doubleValue();
 
-        return future;
+        coinCardAPI.transfer(fromCard, toCard, amountDouble, new TransferCallback() {
+            @Override
+            public void onSuccess(String txId, double amount) {
+                new BukkitRunnable() {
+                    @Override
+                    public void run() {
+                        handleSuccessfulTransaction(transaction, purchase, txId, BigDecimal.valueOf(amount));
+                    }
+                }.runTask(CoinShop.this);
+            }
+
+            @Override
+            public void onFailure(String error) {
+                new BukkitRunnable() {
+                    @Override
+                    public void run() {
+                        handleFailedTransaction(transaction, purchase, error);
+                    }
+                }.runTask(CoinShop.this);
+            }
+        });
     }
 
-    private String formatCoinForApi(BigDecimal amount) {
-        String formatted = amount.setScale(8, RoundingMode.DOWN).toPlainString();
-        if (formatted.contains(".")) {
-            formatted = formatted.replaceAll("0*$", "");
-            if (formatted.endsWith(".")) {
-                formatted = formatted.substring(0, formatted.length() - 1);
+    private void checkPlayerBalance(String cardId, BalanceCheckCallback callback) {
+        if (cardId == null || cardId.isEmpty()) {
+            if (callback != null) {
+                callback.onFailure("Invalid card ID");
             }
+            return;
         }
-        return formatted;
+        
+        coinCardAPI.getBalance(cardId, new BalanceCallback() {
+            @Override
+            public void onResult(double balance, String error) {
+                if (callback != null) {
+                    if (error != null && !error.isEmpty()) {
+                        callback.onFailure(error);
+                    } else {
+                        callback.onSuccess(BigDecimal.valueOf(balance));
+                    }
+                }
+            }
+        });
+    }
+
+    private void getPlayerBalanceByUUID(UUID playerUuid, BalanceCheckCallback callback) {
+        if (playerUuid == null) {
+            if (callback != null) {
+                callback.onFailure("Invalid player UUID");
+            }
+            return;
+        }
+        
+        coinCardAPI.getPlayerBalance(playerUuid, new BalanceCallback() {
+            @Override
+            public void onResult(double balance, String error) {
+                if (callback != null) {
+                    if (error != null && !error.isEmpty()) {
+                        callback.onFailure(error);
+                    } else {
+                        callback.onSuccess(BigDecimal.valueOf(balance));
+                    }
+                }
+            }
+        });
     }
 
     // ====================================================
@@ -414,173 +459,186 @@ public class CoinShop extends JavaPlugin implements Listener {
         }
 
         lastProcessTime.set(now);
-        processTransaction(transaction);
+
+        // Find associated purchase
+        PendingPurchase purchase = pendingPurchases.get(transaction.id);
+        if (purchase == null) {
+            getLogger().warning("No pending purchase found for transaction: " + transaction.id);
+            return;
+        }
+
+        // Process transaction with CoinCard API
+        transferWithCoinCard(transaction.fromCard, transaction.toCard, transaction.amount, 
+                            transaction, purchase);
     }
 
-    private void processTransaction(Transaction transaction) {
-        transferBetweenCards(transaction.fromCard, transaction.toCard, transaction.amount)
-                .thenAccept(response -> {
-                    new BukkitRunnable() {
-                        @Override
-                        public void run() {
-                            if (response.success) {
-                                handleSuccessfulTransaction(transaction, response.txId);
-                            } else {
-                                handleFailedTransaction(transaction, response.error);
-                            }
-                        }
-                    }.runTask(this);
-                })
-                .exceptionally(throwable -> {
-                    new BukkitRunnable() {
-                        @Override
-                        public void run() {
-                            handleFailedTransaction(transaction, throwable.getMessage());
-                        }
-                    }.runTask(this);
-                    return null;
-                });
-    }
+    private void handleSuccessfulTransaction(Transaction transaction, PendingPurchase purchase, 
+                                              String txId, BigDecimal actualAmount) {
+        if (transaction == null || purchase == null) {
+            getLogger().warning("handleSuccessfulTransaction called with null parameters");
+            return;
+        }
+        
+        purchase.completed = true;
+        purchase.txId = txId;
 
-    private void handleSuccessfulTransaction(Transaction transaction, String txId) {
-        for (Map.Entry<String, PendingPurchase> entry : pendingPurchases.entrySet()) {
-            PendingPurchase purchase = entry.getValue();
-            if (purchase.transactionId.equals(transaction.id)) {
-                purchase.completed = true;
-                purchase.txId = txId;
+        // Safe player retrieval with null checks
+        Player buyer = purchase.buyerUuid != null ? Bukkit.getPlayer(purchase.buyerUuid) : null;
+        Player seller = purchase.sellerUuid != null ? Bukkit.getPlayer(purchase.sellerUuid) : null;
+        
+        // Get seller's shop name from store data
+        String sellerShopName = "";
+        for (ShopItem item : storeData.items) {
+            if (item != null && item.transactionId != null && item.transactionId.equals(transaction.id)) {
+                sellerShopName = item.sellerShopName != null ? item.sellerShopName : "";
+                break;
+            }
+        }
+        
+        BigDecimal taxAmount = transaction.amount.multiply(BigDecimal.valueOf(taxRate))
+                .setScale(8, RoundingMode.DOWN);
+        BigDecimal sellerAmount = purchase.price;
 
-                Player buyer = Bukkit.getPlayer(purchase.buyerUuid);
-                Player seller = Bukkit.getPlayer(purchase.sellerUuid);
-                
-                // Get seller's shop name from store data
-                String sellerShopName = "";
-                for (ShopItem item : storeData.items) {
-                    if (item.transactionId.equals(transaction.id)) {
-                        sellerShopName = item.sellerShopName;
-                        break;
-                    }
-                }
-                
-                BigDecimal taxAmount = transaction.amount.multiply(BigDecimal.valueOf(taxRate))
-                        .setScale(8, RoundingMode.DOWN);
-                BigDecimal sellerAmount = purchase.price;
+        // Global sale notification (only if we have valid data)
+        if (!purchase.items.isEmpty() && purchase.items.get(0) != null) {
+            String itemName = purchase.items.get(0).getType().toString();
+            if (purchase.items.get(0).getItemMeta() != null && 
+                purchase.items.get(0).getItemMeta().hasDisplayName()) {
+                itemName = purchase.items.get(0).getItemMeta().getDisplayName();
+            }
+            
+            String globalMessage = ChatColor.GOLD + "[SHOP] " + ChatColor.GREEN + "Shop " + 
+                    ChatColor.YELLOW + (sellerShopName.isEmpty() ? "Unknown" : sellerShopName) + 
+                    ChatColor.GREEN + " sold " + 
+                    ChatColor.AQUA + purchase.items.get(0).getAmount() + "x " + itemName +
+                    ChatColor.GREEN + " for " + 
+                    ChatColor.YELLOW + formatCoin(purchase.price) + " coins!";
+            
+            Bukkit.broadcastMessage(globalMessage);
 
-                // Global sale notification
-                String itemName = purchase.items.get(0).getType().toString();
-                if (purchase.items.get(0).getItemMeta().hasDisplayName()) {
-                    itemName = purchase.items.get(0).getItemMeta().getDisplayName();
-                }
-                
-                String globalMessage = ChatColor.GOLD + "[SHOP] " + ChatColor.GREEN + "Shop " + 
-                        ChatColor.YELLOW + sellerShopName + 
-                        ChatColor.GREEN + " sold " + 
-                        ChatColor.AQUA + purchase.items.get(0).getAmount() + "x " + itemName +
-                        ChatColor.GREEN + " for " + 
-                        ChatColor.YELLOW + formatCoin(purchase.price) + " coins!";
-                
-                Bukkit.broadcastMessage(globalMessage);
-
-                if (buyer != null && buyer.isOnline()) {
-                    for (ItemStack item : purchase.items) {
+            // Give items to buyer
+            if (buyer != null && buyer.isOnline()) {
+                for (ItemStack item : purchase.items) {
+                    if (item != null) {
                         HashMap<Integer, ItemStack> leftover = buyer.getInventory().addItem(item.clone());
                         if (!leftover.isEmpty()) {
                             World world = buyer.getWorld();
                             Location loc = buyer.getLocation();
                             for (ItemStack drop : leftover.values()) {
-                                world.dropItemNaturally(loc, drop);
+                                if (drop != null) {
+                                    world.dropItemNaturally(loc, drop);
+                                }
                             }
                             buyer.sendMessage(ChatColor.YELLOW + "Some items were dropped because your inventory was full!");
                         }
                     }
-                    buyer.sendMessage(ChatColor.GREEN + "Your purchase of " + formatCoin(transaction.amount) +
-                            " coins has been completed! Transaction ID: " + txId);
                 }
+                buyer.sendMessage(ChatColor.GREEN + "Your purchase of " + formatCoin(transaction.amount) +
+                        " coins has been completed! Transaction ID: " + (txId != null ? txId : "unknown"));
+            }
 
-                // Notification for seller
-                if (seller != null && seller.isOnline()) {
-                    seller.sendMessage(ChatColor.GREEN + "[SUCCESS] " + ChatColor.YELLOW + "ITEM SOLD!");
-                    seller.sendMessage(ChatColor.GRAY + "Item: " + ChatColor.WHITE + purchase.items.get(0).getAmount() + "x " + itemName);
-                    seller.sendMessage(ChatColor.GRAY + "Buyer: " + ChatColor.WHITE + (buyer != null ? buyer.getName() : "Unknown"));
-                    seller.sendMessage(ChatColor.GRAY + "Item price: " + ChatColor.GREEN + formatCoin(purchase.price));
-                    seller.sendMessage(ChatColor.GRAY + "Tax (" + (taxRate * 100) + "%): " + ChatColor.RED + "-" + formatCoin(taxAmount));
-                    seller.sendMessage(ChatColor.GRAY + "Amount received: " + ChatColor.GREEN + formatCoin(sellerAmount));
-                    seller.sendMessage(ChatColor.GRAY + "Transaction: " + ChatColor.WHITE + txId);
-                    seller.sendMessage(ChatColor.GREEN + "The amount has been credited to your card!");
-                }
-
-                if (taxRate > 0 && serverCardId != null && !serverCardId.isEmpty()) {
-                    if (taxAmount.compareTo(BigDecimal.ZERO) > 0) {
-                        Transaction taxTransaction = new Transaction(
-                                UUID.randomUUID().toString(),
-                                transaction.toCard,
-                                serverCardId,
-                                taxAmount
-                        );
-                        transactionQueue.add(taxTransaction);
-                    }
-                }
-
-                pendingPurchases.remove(entry.getKey());
-                break;
+            // Notification for seller
+            if (seller != null && seller.isOnline()) {
+                seller.sendMessage(ChatColor.GREEN + "[SUCCESS] " + ChatColor.YELLOW + "ITEM SOLD!");
+                seller.sendMessage(ChatColor.GRAY + "Item: " + ChatColor.WHITE + purchase.items.get(0).getAmount() + "x " + itemName);
+                seller.sendMessage(ChatColor.GRAY + "Buyer: " + ChatColor.WHITE + (buyer != null ? buyer.getName() : "Unknown"));
+                seller.sendMessage(ChatColor.GRAY + "Item price: " + ChatColor.GREEN + formatCoin(purchase.price));
+                seller.sendMessage(ChatColor.GRAY + "Tax (" + (taxRate * 100) + "%): " + ChatColor.RED + "-" + formatCoin(taxAmount));
+                seller.sendMessage(ChatColor.GRAY + "Amount received: " + ChatColor.GREEN + formatCoin(sellerAmount));
+                seller.sendMessage(ChatColor.GRAY + "Transaction: " + ChatColor.WHITE + (txId != null ? txId : "unknown"));
+                seller.sendMessage(ChatColor.GREEN + "The amount has been credited to your card!");
             }
         }
 
-        storeData.items.removeIf(item -> item.transactionId.equals(transaction.id));
+        // Process tax if applicable
+        if (taxRate > 0 && serverCardId != null && !serverCardId.isEmpty() && 
+            taxAmount != null && taxAmount.compareTo(BigDecimal.ZERO) > 0) {
+            processTaxTransaction(transaction.toCard, taxAmount, transaction.id);
+        }
+
+        pendingPurchases.remove(transaction.id);
+        storeData.items.removeIf(item -> item != null && item.transactionId != null && item.transactionId.equals(transaction.id));
         saveStoreData();
     }
 
-    private void handleFailedTransaction(Transaction transaction, String error) {
-        for (Map.Entry<String, PendingPurchase> entry : pendingPurchases.entrySet()) {
-            if (entry.getValue().transactionId.equals(transaction.id)) {
-                PendingPurchase purchase = entry.getValue();
-                
-                Player buyer = Bukkit.getPlayer(purchase.buyerUuid);
-                Player seller = Bukkit.getPlayer(purchase.sellerUuid);
-                
-                // Get seller's data
-                PlayerData sellerData = getPlayerData(purchase.sellerUuid);
-                
-                // Recreate the item in the shop
-                for (ItemStack item : purchase.items) {
-                    ShopItem shopItem = new ShopItem(
-                        transaction.id,
-                        purchase.sellerUuid,
-                        transaction.toCard,
-                        sellerData.shopName,
-                        sellerData.shopName,
-                        item,
-                        purchase.price,
-                        System.currentTimeMillis()
-                    );
-                    
-                    storeData.items.add(shopItem);
-                }
-                
-                saveStoreData();
+    private void processTaxTransaction(String fromCard, BigDecimal taxAmount, String originalTxId) {
+        if (fromCard == null || taxAmount == null || serverCardId == null || serverCardId.isEmpty()) {
+            return;
+        }
+        
+        String taxTxId = UUID.randomUUID().toString();
+        Transaction taxTransaction = new Transaction(
+                taxTxId,
+                fromCard,
+                serverCardId,
+                taxAmount
+        );
 
-                if (buyer != null && buyer.isOnline()) {
-                    buyer.sendMessage(ChatColor.RED + "[FAILED] Transaction failed: " + error);
-                    buyer.sendMessage(ChatColor.YELLOW + "The item has been returned to the shop. You were not charged.");
-                }
+        // Create a temporary purchase for tax tracking
+        PendingPurchase taxPurchase = new PendingPurchase(
+                taxTxId,
+                null,
+                null,
+                Collections.emptyList(),
+                taxAmount
+        );
+        pendingPurchases.put(taxTxId, taxPurchase);
 
-                // Notify the seller about the failure
-                if (seller != null && seller.isOnline()) {
-                    String itemName = purchase.items.get(0).getType().toString();
-                    if (purchase.items.get(0).getItemMeta().hasDisplayName()) {
-                        itemName = purchase.items.get(0).getItemMeta().getDisplayName();
-                    }
-                    
-                    seller.sendMessage(ChatColor.RED + "[FAILED] " + ChatColor.YELLOW + "SALE FAILED!");
-                    seller.sendMessage(ChatColor.GRAY + "Item: " + ChatColor.WHITE + purchase.items.get(0).getAmount() + "x " + itemName);
-                    seller.sendMessage(ChatColor.GRAY + "Reason: " + ChatColor.RED + error);
-                    seller.sendMessage(ChatColor.GREEN + "The item has been returned to your shop inventory.");
-                }
+        transferWithCoinCard(fromCard, serverCardId, taxAmount, taxTransaction, taxPurchase);
+    }
 
-                pendingPurchases.remove(entry.getKey());
-                break;
+    private void handleFailedTransaction(Transaction transaction, PendingPurchase purchase, String error) {
+        if (transaction == null || purchase == null) {
+            getLogger().warning("handleFailedTransaction called with null parameters");
+            return;
+        }
+        
+        Player buyer = purchase.buyerUuid != null ? Bukkit.getPlayer(purchase.buyerUuid) : null;
+        Player seller = purchase.sellerUuid != null ? Bukkit.getPlayer(purchase.sellerUuid) : null;
+        
+        // Get seller's data
+        PlayerData sellerData = purchase.sellerUuid != null ? getPlayerData(purchase.sellerUuid) : null;
+        
+        // Recreate the item in the shop
+        for (ItemStack item : purchase.items) {
+            if (item != null) {
+                ShopItem shopItem = new ShopItem(
+                    transaction.id,
+                    purchase.sellerUuid,
+                    transaction.toCard,
+                    sellerData != null ? sellerData.shopName : "Unknown",
+                    sellerData != null ? sellerData.shopName : "Unknown",
+                    item,
+                    purchase.price,
+                    System.currentTimeMillis()
+                );
+                
+                storeData.items.add(shopItem);
             }
         }
+        
+        saveStoreData();
 
+        if (buyer != null && buyer.isOnline()) {
+            buyer.sendMessage(ChatColor.RED + "[FAILED] Transaction failed: " + (error != null ? error : "Unknown error"));
+            buyer.sendMessage(ChatColor.YELLOW + "The item has been returned to the shop. You were not charged.");
+        }
+
+        // Notify the seller about the failure
+        if (seller != null && seller.isOnline() && !purchase.items.isEmpty() && purchase.items.get(0) != null) {
+            String itemName = purchase.items.get(0).getType().toString();
+            if (purchase.items.get(0).getItemMeta() != null && 
+                purchase.items.get(0).getItemMeta().hasDisplayName()) {
+                itemName = purchase.items.get(0).getItemMeta().getDisplayName();
+            }
+            
+            seller.sendMessage(ChatColor.RED + "[FAILED] " + ChatColor.YELLOW + "SALE FAILED!");
+            seller.sendMessage(ChatColor.GRAY + "Item: " + ChatColor.WHITE + purchase.items.get(0).getAmount() + "x " + itemName);
+            seller.sendMessage(ChatColor.GRAY + "Reason: " + ChatColor.RED + (error != null ? error : "Unknown error"));
+            seller.sendMessage(ChatColor.GREEN + "The item has been returned to your shop inventory.");
+        }
+
+        pendingPurchases.remove(transaction.id);
         saveStoreData();
     }
 
@@ -588,6 +646,10 @@ public class CoinShop extends JavaPlugin implements Listener {
     // SHOP LOGIC
     // ====================================================
     private boolean createListing(Player player, ItemStack item, BigDecimal price) {
+        if (player == null || item == null || price == null) {
+            return false;
+        }
+        
         if (price.compareTo(minPrice) < 0 || price.compareTo(maxPrice) > 0) {
             player.sendMessage(ChatColor.RED + "Price must be between " + formatCoin(minPrice) +
                     " and " + formatCoin(maxPrice));
@@ -595,8 +657,8 @@ public class CoinShop extends JavaPlugin implements Listener {
         }
 
         PlayerData data = getPlayerData(player.getUniqueId());
-        if (data.cardId == null || data.cardId.isEmpty()) {
-            player.sendMessage(ChatColor.RED + "You don't have a card ID set! Use /cshop card <CardID>");
+        if (data == null || data.cardId == null || data.cardId.isEmpty()) {
+            player.sendMessage(ChatColor.RED + "You don't have a card ID set! Please contact an administrator.");
             return false;
         }
 
@@ -606,7 +668,7 @@ public class CoinShop extends JavaPlugin implements Listener {
                 player.getUniqueId(),
                 data.cardId,
                 player.getName(),
-                data.shopName,
+                data.shopName != null ? data.shopName : player.getName() + "'s shop",
                 item.clone(),
                 price,
                 System.currentTimeMillis()
@@ -620,51 +682,75 @@ public class CoinShop extends JavaPlugin implements Listener {
     }
 
     private boolean purchaseItem(Player buyer, ShopItem item) {
+        if (buyer == null || item == null) {
+            return false;
+        }
+        
         if (!storeData.items.contains(item)) {
             buyer.sendMessage(ChatColor.RED + "This item is no longer available!");
             return false;
         }
 
         PlayerData buyerData = getPlayerData(buyer.getUniqueId());
-        if (buyerData.cardId == null || buyerData.cardId.isEmpty()) {
-            buyer.sendMessage(ChatColor.RED + "You don't have a card ID set! Use /cshop card <CardID>");
+        if (buyerData == null || buyerData.cardId == null || buyerData.cardId.isEmpty()) {
+            buyer.sendMessage(ChatColor.RED + "You don't have a card ID set! Please contact an administrator.");
             return false;
         }
 
-        BigDecimal totalPrice = item.price;
-        if (taxRate > 0) {
-            totalPrice = totalPrice.add(totalPrice.multiply(BigDecimal.valueOf(taxRate)))
-                    .setScale(8, RoundingMode.DOWN);
-        }
+        // Check if buyer has enough balance using getPlayerBalance
+        getPlayerBalanceByUUID(buyer.getUniqueId(), new BalanceCheckCallback() {
+            @Override
+            public void onSuccess(BigDecimal balance) {
+                BigDecimal totalPrice = item.price;
+                if (taxRate > 0) {
+                    totalPrice = totalPrice.add(totalPrice.multiply(BigDecimal.valueOf(taxRate)))
+                            .setScale(8, RoundingMode.DOWN);
+                }
 
-        String transactionId = UUID.randomUUID().toString();
-        Transaction transaction = new Transaction(
-                transactionId,
-                buyerData.cardId,
-                item.sellerCardId,
-                totalPrice
-        );
+                if (balance.compareTo(totalPrice) < 0) {
+                    buyer.sendMessage(ChatColor.RED + "Insufficient balance! You need " + 
+                            formatCoin(totalPrice) + " but have " + formatCoin(balance));
+                    return;
+                }
 
-        PendingPurchase purchase = new PendingPurchase(
-                transactionId,
-                buyer.getUniqueId(),
-                item.sellerUuid,
-                Collections.singletonList(item.item.clone()),
-                item.price
-        );
+                String transactionId = UUID.randomUUID().toString();
+                Transaction transaction = new Transaction(
+                        transactionId,
+                        buyerData.cardId,
+                        item.sellerCardId,
+                        totalPrice
+                );
 
-        pendingPurchases.put(transactionId, purchase);
+                PendingPurchase purchase = new PendingPurchase(
+                        transactionId,
+                        buyer.getUniqueId(),
+                        item.sellerUuid,
+                        Collections.singletonList(item.item.clone()),
+                        item.price
+                );
 
-        storeData.items.remove(item);
-        saveStoreData();
+                pendingPurchases.put(transactionId, purchase);
+                storeData.items.remove(item);
+                saveStoreData();
+                transactionQueue.add(transaction);
 
-        transactionQueue.add(transaction);
+                buyer.sendMessage(ChatColor.YELLOW + "Purchase queued! You will receive your items once the transaction completes.");
+            }
 
-        buyer.sendMessage(ChatColor.YELLOW + "Purchase queued! You will receive your items once the transaction completes.");
+            @Override
+            public void onFailure(String error) {
+                buyer.sendMessage(ChatColor.RED + "Failed to check balance: " + (error != null ? error : "Unknown error"));
+            }
+        });
+
         return true;
     }
 
     private boolean cancelListing(Player player, ShopItem item) {
+        if (player == null || item == null) {
+            return false;
+        }
+        
         if (!item.sellerUuid.equals(player.getUniqueId())) {
             player.sendMessage(ChatColor.RED + "This is not your item to cancel!");
             return false;
@@ -676,7 +762,9 @@ public class CoinShop extends JavaPlugin implements Listener {
                 World world = player.getWorld();
                 Location loc = player.getLocation();
                 for (ItemStack drop : leftover.values()) {
-                    world.dropItemNaturally(loc, drop);
+                    if (drop != null) {
+                        world.dropItemNaturally(loc, drop);
+                    }
                 }
                 player.sendMessage(ChatColor.YELLOW + "Some items were dropped because your inventory was full!");
             }
@@ -733,7 +821,7 @@ public class CoinShop extends JavaPlugin implements Listener {
 
     private Inventory buildMyShopMenu(Player player, int page) {
         List<ShopItem> myItems = storeData.items.stream()
-                .filter(item -> item.sellerUuid.equals(player.getUniqueId()))
+                .filter(item -> item != null && item.sellerUuid != null && item.sellerUuid.equals(player.getUniqueId()))
                 .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
                 .collect(Collectors.toList());
 
@@ -742,6 +830,7 @@ public class CoinShop extends JavaPlugin implements Listener {
 
     private Inventory buildGlobalShopMenu(Player player, int page) {
         List<ShopItem> allItems = storeData.items.stream()
+                .filter(Objects::nonNull)
                 .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
                 .collect(Collectors.toList());
 
@@ -760,6 +849,8 @@ public class CoinShop extends JavaPlugin implements Listener {
 
         for (int i = start; i < end; i++) {
             ShopItem shopItem = items.get(i);
+            if (shopItem == null || shopItem.item == null) continue;
+            
             ItemStack displayItem = shopItem.item.clone();
             ItemMeta meta = displayItem.getItemMeta();
             List<String> lore = meta.hasLore() ? meta.getLore() : new ArrayList<>();
@@ -770,7 +861,8 @@ public class CoinShop extends JavaPlugin implements Listener {
                         .setScale(8, RoundingMode.DOWN);
                 lore.add(ChatColor.GRAY + "Total with tax: " + ChatColor.WHITE + formatCoin(total));
             }
-            lore.add(ChatColor.GRAY + "Seller: " + ChatColor.WHITE + shopItem.sellerShopName);
+            lore.add(ChatColor.GRAY + "Seller: " + ChatColor.WHITE + 
+                    (shopItem.sellerShopName != null ? shopItem.sellerShopName : "Unknown"));
             if (isMyShop) {
                 lore.add("");
                 lore.add(ChatColor.RED + "Click to cancel listing");
@@ -823,6 +915,9 @@ public class CoinShop extends JavaPlugin implements Listener {
     // UTILITY METHODS
     // ====================================================
     private String formatCoin(BigDecimal amount) {
+        if (amount == null) {
+            return "0";
+        }
         String formatted = COIN_FORMAT.format(amount);
         if (!formatted.contains(".")) {
             formatted += ".0";
@@ -902,16 +997,19 @@ public class CoinShop extends JavaPlugin implements Listener {
     }
 
     private void handleItemClick(Player player, int slot, ItemStack clickedItem, String title, boolean isMyShop) {
+        if (player == null) return;
+        
         List<ShopItem> items;
         int page = extractPageNumber(title);
 
         if (isMyShop) {
             items = storeData.items.stream()
-                    .filter(item -> item.sellerUuid.equals(player.getUniqueId()))
+                    .filter(item -> item != null && item.sellerUuid != null && item.sellerUuid.equals(player.getUniqueId()))
                     .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
                     .collect(Collectors.toList());
         } else {
             items = storeData.items.stream()
+                    .filter(Objects::nonNull)
                     .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
                     .collect(Collectors.toList());
         }
@@ -919,6 +1017,7 @@ public class CoinShop extends JavaPlugin implements Listener {
         int index = page * 45 + slot;
         if (index < items.size()) {
             ShopItem shopItem = items.get(index);
+            if (shopItem == null) return;
 
             if (isMyShop) {
                 cancelListing(player, shopItem);
@@ -942,7 +1041,9 @@ public class CoinShop extends JavaPlugin implements Listener {
 
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
-        playerSessions.remove(event.getPlayer().getUniqueId());
+        if (event.getPlayer() != null) {
+            playerSessions.remove(event.getPlayer().getUniqueId());
+        }
     }
 
     // ====================================================
@@ -1003,14 +1104,6 @@ public class CoinShop extends JavaPlugin implements Listener {
                     player.openInventory(buildMyShopMenu(player, 0));
                     break;
 
-                case "card":
-                    if (args.length < 2) {
-                        player.sendMessage(ChatColor.RED + "Usage: /cshop card <CardID>");
-                        return true;
-                    }
-                    setPlayerCard(player, args[1]);
-                    break;
-
                 case "name":
                     if (args.length < 2) {
                         player.sendMessage(ChatColor.RED + "Usage: /cshop name <shop name>");
@@ -1018,6 +1111,10 @@ public class CoinShop extends JavaPlugin implements Listener {
                     }
                     String shopName = String.join(" ", Arrays.copyOfRange(args, 1, args.length));
                     setPlayerShopName(player, shopName);
+                    break;
+
+                case "balance":
+                    checkPlayerBalanceCommand(player);
                     break;
 
                 default:
@@ -1028,25 +1125,24 @@ public class CoinShop extends JavaPlugin implements Listener {
             return true;
         }
 
-        private void setPlayerCard(Player player, String cardId) {
-            PlayerData data = getPlayerData(player.getUniqueId());
-            data.cardId = cardId;
-            savePlayerData(data);
-            player.sendMessage(ChatColor.GREEN + "Your Card ID has been set to: " + cardId);
-        }
-
         private void setPlayerShopName(Player player, String shopName) {
+            if (player == null) return;
+            
             if (shopName.length() > 32) {
                 player.sendMessage(ChatColor.RED + "Shop name too long! Maximum 32 characters.");
                 return;
             }
             PlayerData data = getPlayerData(player.getUniqueId());
-            data.shopName = shopName;
-            savePlayerData(data);
-            player.sendMessage(ChatColor.GREEN + "Your shop name has been set to: " + shopName);
+            if (data != null) {
+                data.shopName = shopName;
+                savePlayerData(data);
+                player.sendMessage(ChatColor.GREEN + "Your shop name has been set to: " + shopName);
+            }
         }
 
         private void handleSellCommand(Player player, String[] args) {
+            if (player == null || args == null || args.length < 3) return;
+            
             ItemStack item = player.getInventory().getItemInMainHand();
             if (item == null || item.getType() == Material.AIR) {
                 player.sendMessage(ChatColor.RED + "You must hold an item to sell!");
@@ -1087,6 +1183,8 @@ public class CoinShop extends JavaPlugin implements Listener {
         }
 
         private void openShopByName(Player player, String shopName) {
+            if (player == null || shopName == null) return;
+            
             UUID ownerUuid = null;
             File[] userFiles = usersFolder.listFiles((dir, name) -> name.endsWith(".yml"));
             if (userFiles != null) {
@@ -1109,7 +1207,7 @@ public class CoinShop extends JavaPlugin implements Listener {
 
             UUID finalOwnerUuid = ownerUuid;
             List<ShopItem> shopItems = storeData.items.stream()
-                    .filter(item -> item.sellerUuid.equals(finalOwnerUuid))
+                    .filter(item -> item != null && item.sellerUuid != null && item.sellerUuid.equals(finalOwnerUuid))
                     .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
                     .collect(Collectors.toList());
 
@@ -1118,7 +1216,7 @@ public class CoinShop extends JavaPlugin implements Listener {
 
             int slot = 0;
             for (ShopItem item : shopItems) {
-                if (slot >= 45) break;
+                if (slot >= 45 || item == null || item.item == null) break;
 
                 ItemStack displayItem = item.item.clone();
                 ItemMeta meta = displayItem.getItemMeta();
@@ -1153,6 +1251,30 @@ public class CoinShop extends JavaPlugin implements Listener {
             player.openInventory(inv);
         }
 
+        private void checkPlayerBalanceCommand(Player player) {
+            if (player == null) return;
+            
+            PlayerData data = getPlayerData(player.getUniqueId());
+            if (data == null || data.cardId == null || data.cardId.isEmpty()) {
+                player.sendMessage(ChatColor.RED + "You don't have a card ID set! Please contact an administrator.");
+                return;
+            }
+
+            // Use getPlayerBalanceByUUID instead of checkPlayerBalance
+            getPlayerBalanceByUUID(player.getUniqueId(), new BalanceCheckCallback() {
+                @Override
+                public void onSuccess(BigDecimal balance) {
+                    player.sendMessage(ChatColor.GREEN + "Your CoinCard balance: " + 
+                            ChatColor.YELLOW + formatCoin(balance));
+                }
+
+                @Override
+                public void onFailure(String error) {
+                    player.sendMessage(ChatColor.RED + "Failed to check balance: " + (error != null ? error : "Unknown error"));
+                }
+            });
+        }
+
         @Override
         public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
             List<String> completions = new ArrayList<>();
@@ -1162,8 +1284,8 @@ public class CoinShop extends JavaPlugin implements Listener {
                 completions.add("open");
                 completions.add("sell");
                 completions.add("cancel");
-                completions.add("card");
                 completions.add("name");
+                completions.add("balance");
                 return completions.stream()
                         .filter(s -> s.startsWith(args[0].toLowerCase()))
                         .collect(Collectors.toList());
@@ -1244,7 +1366,7 @@ public class CoinShop extends JavaPlugin implements Listener {
             this.transactionId = transactionId;
             this.buyerUuid = buyerUuid;
             this.sellerUuid = sellerUuid;
-            this.items = items;
+            this.items = items != null ? items : new ArrayList<>();
             this.price = price;
             this.completed = false;
         }
@@ -1275,15 +1397,8 @@ public class CoinShop extends JavaPlugin implements Listener {
         }
     }
 
-    private static class ApiResponse {
-        boolean success;
-        String txId;
-        String error;
-
-        ApiResponse(boolean success, String txId, String error) {
-            this.success = success;
-            this.txId = txId;
-            this.error = error;
-        }
+    private interface BalanceCheckCallback {
+        void onSuccess(BigDecimal balance);
+        void onFailure(String error);
     }
 }

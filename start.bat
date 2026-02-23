@@ -1,8 +1,8 @@
 @echo off
-title Compilador CoinShop - Java 17
+title Compilador CoinShop v2.0 - Java 17
 
 echo ============================================
-echo Compilador do Plugin CoinShop
+echo Compilador do Plugin CoinShop (Integracao CoinCard)
 echo ============================================
 echo.
 
@@ -76,15 +76,35 @@ if not exist libs\gson-2.10.1.jar (
     echo [OK] Gson encontrado em libs\
 )
 
+REM Verificar CoinCard API
+if not exist CoinCard.jar (
+    echo [AVISO] CoinCard.jar nao encontrado na pasta raiz!
+    echo O plugin CoinShop requer o CoinCard como dependencia.
+    echo.
+    echo Certifique-se de que o CoinCard.jar esta na pasta plugins do servidor.
+    echo Continuando compilacao mesmo assim...
+    echo.
+    set COINCARD_PATH=
+) else (
+    echo [OK] CoinCard API encontrado
+    set COINCARD_PATH=CoinCard.jar
+)
+
 echo.
 echo ============================================
 echo Compilando CoinShop...
 echo ============================================
 echo.
 
+REM Montar classpath
+set CLASSPATH="spigot-api-1.20.1-R0.1-SNAPSHOT.jar;libs\gson-2.10.1.jar"
+if defined COINCARD_PATH (
+    set CLASSPATH=%CLASSPATH%;CoinCard.jar
+)
+
 REM Compilar com as dependências necessárias
 %JAVAC% --release 17 -d out ^
--classpath "spigot-api-1.20.1-R0.1-SNAPSHOT.jar;libs\gson-2.10.1.jar" ^
+-classpath %CLASSPATH% ^
 -sourcepath src ^
 src/com/foxsrv/coinshop/CoinShop.java
 
@@ -117,17 +137,21 @@ if exist resources\plugin.yml (
     
     (
         echo name: CoinShop
-        echo version: 1.0
+        echo version: 2.0
         echo main: com.foxsrv.coinshop.CoinShop
         echo api-version: 1.20
         echo author: FoxOficial2
-        echo description: A Player Coin Shop plugin
+        echo description: A Player Coin Shop plugin with CoinCard integration
+        echo depend: [CoinCard]
         echo.
         echo commands:
         echo   coinshop:
         echo     description: Main CoinShop command
         echo     aliases: [cshop]
-        echo     usage: /coinshop [reload^|open^|sell^|cancel^|card^|name]
+        echo     usage: /coinshop [reload^|open^|sell^|cancel^|name^|balance]
+        echo   cshop:
+        echo     description: Alias for coinshop command
+        echo     usage: /cshop [reload^|open^|sell^|cancel^|name^|balance]
         echo.
         echo permissions:
         echo   coinshop.*:
@@ -166,11 +190,8 @@ if exist resources\config.yml (
         echo Min: 0.00000001
         echo Max: 1000.0
         echo.
-        echo # API URL for coin transactions
-        echo API: "https://bank.foxsrv.net"
-        echo.
         echo # Cooldown between transactions in milliseconds
-        echo Cooldown: 1000
+        echo Cooldown: 1100
     ) > out\config.yml
     echo [OK] config.yml criado automaticamente
 )
@@ -183,7 +204,7 @@ echo.
 
 cd out
 
-REM Criar JAR com todos os recursos (incluindo as pastas)
+REM Criar JAR com todos os recursos
 %JAR% cf CoinShop.jar com plugin.yml config.yml
 
 cd ..
@@ -198,9 +219,21 @@ echo.
 dir out\CoinShop.jar
 echo.
 echo ============================================
+echo IMPORTANTE - REQUISITOS PARA EXECUCAO:
+echo ============================================
+echo.
+echo 1 - O plugin CoinCard DEVE estar instalado no servidor
+echo 2 - Adicione no plugin.xml do CoinCard:
+echo     ^<permission^>
+echo         ^<name^>coincard.api^</name^>
+echo     ^</permission^>
+echo 3 - Certifique-se de que ambos os plugins estao na pasta plugins/
+echo.
+echo ============================================
 echo Para instalar:
 echo 1 - Copie out\CoinShop.jar para a pasta plugins do servidor
-echo 2 - Reinicie o servidor ou use /reload confirm
+echo 2 - Copie CoinCard.jar para a pasta plugins do servidor (se ainda nao estiver)
+echo 3 - Reinicie o servidor ou use /reload confirm
 echo ============================================
 echo.
 

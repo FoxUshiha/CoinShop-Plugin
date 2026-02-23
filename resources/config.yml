@@ -9,8 +9,5 @@ Tax: 0.1
 Min: 0.00000001
 Max: 1000.0
 
-# API URL for coin transactions
-API: "https://bank.foxsrv.net"
-
 # Cooldown between transactions in milliseconds
 Cooldown: 1100
