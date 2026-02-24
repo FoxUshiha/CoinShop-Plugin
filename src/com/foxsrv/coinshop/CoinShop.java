@@ -1334,7 +1334,7 @@ public class CoinShop extends JavaPlugin implements Listener {
 
         // Allow admins in creative to cancel items with middle click
         if (isAdminWithCreative(player) && event.getClick() == ClickType.MIDDLE) {
-            handleAdminCancel(player, event.getCurrentItem(), holder);
+          handleAdminCancel(player, event.getCurrentItem(), holder, event.getSlot());
             return;
         }
 
@@ -1447,57 +1447,149 @@ public class CoinShop extends JavaPlugin implements Listener {
                 .collect(Collectors.toList());
     }
 
-    private void handleAdminCancel(Player admin, ItemStack clickedItem, ShopInventoryHolder holder) {
-        if (clickedItem == null || clickedItem.getType() == Material.AIR || 
-            !clickedItem.hasItemMeta() || clickedItem.getItemMeta().getDisplayName().equals(" ")) {
-            return;
-        }
+private void handleAdminCancel(Player admin, ItemStack clickedItem, ShopInventoryHolder holder, int slot) {
+    if (clickedItem == null || clickedItem.getType() == Material.AIR || 
+        !clickedItem.hasItemMeta() || clickedItem.getItemMeta().getDisplayName().equals(" ")) {
+        return;
+    }
 
-        List<ShopItem> items = getFilteredItems(admin, holder.getCategory(), 
-                                                holder.getType() == ShopInventoryHolder.Type.MY_SHOP);
+    // Obter a lista de itens baseado no tipo de loja
+    List<ShopItem> items;
+    if (holder.getType() == ShopInventoryHolder.Type.MY_SHOP) {
+        items = storeData.items.stream()
+                .filter(item -> item != null && item.sellerUuid != null && 
+                       item.sellerUuid.equals(admin.getUniqueId()))
+                .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
+                .collect(Collectors.toList());
+    } else if (holder.getType() == ShopInventoryHolder.Type.CATEGORY_SHOP && holder.getCategory() != null) {
+        ItemCategory category = holder.getCategory();
+        items = storeData.items.stream()
+                .filter(item -> item != null && item.item != null)
+                .filter(item -> category == ItemCategory.ALL || 
+                       ItemCategory.fromMaterial(item.item.getType()) == category)
+                .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
+                .collect(Collectors.toList());
+    } else {
+        items = storeData.items.stream()
+                .filter(Objects::nonNull)
+                .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
+                .collect(Collectors.toList());
+    }
+    
+    int page = holder.getPage();
+    
+    // Calcular o índice correto baseado no slot e página
+    if (slot < 45) { // Apenas slots de itens (não botões de navegação)
+        int index = page * 45 + slot;
         
-        int page = holder.getPage();
-        int slot = -1;
-        
-        // Tentar encontrar o item baseado no preço e nome do vendedor
-        List<String> lore = clickedItem.getItemMeta().getLore();
-        if (lore != null) {
-            String priceStr = null;
-            String sellerStr = null;
+        if (index < items.size()) {
+            ShopItem itemToCancel = items.get(index);
             
-            for (String line : lore) {
-                String cleanLine = ChatColor.stripColor(line);
-                if (cleanLine.contains("Price:")) {
-                    priceStr = cleanLine.replace("Price:", "").trim();
-                } else if (cleanLine.contains("Seller:")) {
-                    sellerStr = cleanLine.replace("Seller:", "").trim();
-                }
-            }
+            // Verificar se o item clicado corresponde ao item encontrado
+            String clickedPrice = null;
+            String clickedSeller = null;
             
-            if (priceStr != null) {
-                for (int i = 0; i < items.size(); i++) {
-                    ShopItem item = items.get(i);
-                    if (formatCoin(item.price).equals(priceStr)) {
-                        if (sellerStr == null || item.sellerShopName.equals(sellerStr)) {
-                            slot = i;
-                            break;
-                        }
+            List<String> lore = clickedItem.getItemMeta().getLore();
+            if (lore != null) {
+                for (String line : lore) {
+                    String cleanLine = ChatColor.stripColor(line);
+                    if (cleanLine.contains("Price:")) {
+                        clickedPrice = cleanLine.replace("Price:", "").trim();
+                    } else if (cleanLine.contains("Seller:")) {
+                        clickedSeller = cleanLine.replace("Seller:", "").trim();
                     }
                 }
             }
-        }
-
-        if (slot >= 0) {
-            int index = page * 45 + (slot % 45);
-            if (index < items.size()) {
-                ShopItem itemToCancel = items.get(index);
-                cancelListing(admin, itemToCancel);
-                admin.sendMessage(ChatColor.GREEN + "Item cancelled by admin.");
+            
+            String itemPrice = formatCoin(itemToCancel.price);
+            String itemSeller = itemToCancel.sellerShopName;
+            
+            // Verificar se os dados do item clicado correspondem ao item encontrado
+            boolean matches = true;
+            if (clickedPrice != null && !clickedPrice.equals(itemPrice)) {
+                matches = false;
+            }
+            if (clickedSeller != null && !clickedSeller.equals(itemSeller)) {
+                matches = false;
+            }
+            
+            if (!matches) {
+                admin.sendMessage(ChatColor.RED + "Could not identify the correct item to cancel!");
+                return;
+            }
+            
+            // Remover o item da loja
+            if (storeData.items.remove(itemToCancel)) {
+                saveStoreData();
+                
+                // Tentar devolver ao vendedor original
+                Player seller = Bukkit.getPlayer(itemToCancel.sellerUuid);
+                String itemName = itemToCancel.item.getType().toString();
+                if (itemToCancel.item.getItemMeta() != null && 
+                    itemToCancel.item.getItemMeta().hasDisplayName()) {
+                    itemName = itemToCancel.item.getItemMeta().getDisplayName();
+                }
+                
+                if (seller != null && seller.isOnline()) {
+                    // Vendedor online - tentar dar o item
+                    HashMap<Integer, ItemStack> leftover = seller.getInventory().addItem(itemToCancel.item.clone());
+                    
+                    if (!leftover.isEmpty()) {
+                        // Inventário cheio - dropar no chão
+                        World world = seller.getWorld();
+                        Location loc = seller.getLocation();
+                        for (ItemStack drop : leftover.values()) {
+                            if (drop != null) {
+                                world.dropItemNaturally(loc, drop);
+                            }
+                        }
+                        seller.sendMessage(ChatColor.YELLOW + "Your inventory was full! Some items were dropped on the ground.");
+                    }
+                    
+                    // Notificar o vendedor
+                    seller.sendMessage(ChatColor.RED + "ADMIN CANCELLATION");
+                    seller.sendMessage(ChatColor.GRAY + "An admin has cancelled your listing:");
+                    seller.sendMessage(ChatColor.GRAY + "Item: " + ChatColor.WHITE + itemToCancel.item.getAmount() + "x " + itemName);
+                    seller.sendMessage(ChatColor.GRAY + "Price: " + ChatColor.WHITE + formatCoin(itemToCancel.price));
+                    seller.sendMessage(ChatColor.GRAY + "Admin: " + ChatColor.WHITE + admin.getName());
+                    seller.sendMessage(ChatColor.GREEN + "The item has been returned to your inventory.");
+                    
+                } else {
+                    // Vendedor offline - armazenar para entrega posterior
+                    pendingItemReturns.computeIfAbsent(itemToCancel.sellerUuid, k -> new ArrayList<>())
+                            .add(itemToCancel.item.clone());
+                    savePendingReturns();
+                    
+                    getLogger().info("Item cancelled by admin " + admin.getName() + 
+                            " for offline player " + itemToCancel.sellerUuid + 
+                            " - Item stored for later delivery");
+                }
+                
+                // Notificar o admin
+                admin.sendMessage(ChatColor.GREEN + "ITEM CANCELLED SUCCESSFULLY");
+                admin.sendMessage(ChatColor.GRAY + "Item: " + ChatColor.WHITE + itemToCancel.item.getAmount() + "x " + itemName);
+                admin.sendMessage(ChatColor.GRAY + "Seller: " + ChatColor.WHITE + itemToCancel.sellerShopName);
+                admin.sendMessage(ChatColor.GRAY + "Price: " + ChatColor.WHITE + formatCoin(itemToCancel.price));
+                
+                if (seller != null && seller.isOnline()) {
+                    admin.sendMessage(ChatColor.GREEN + "Item returned to seller (online)");
+                } else {
+                    admin.sendMessage(ChatColor.YELLOW + "Seller is offline - Item will be returned when they join");
+                }
+                
+                // Recarregar a página
                 reopenPage(admin, holder.getCategory(), page, 
                           holder.getType() == ShopInventoryHolder.Type.MY_SHOP);
+            } else {
+                admin.sendMessage(ChatColor.RED + "Item no longer exists in shop!");
             }
+        } else {
+            admin.sendMessage(ChatColor.RED + "Item index out of range!");
         }
+    } else {
+        admin.sendMessage(ChatColor.RED + "This is not a valid item slot!");
     }
+}
 
     @EventHandler
     public void onInventoryDrag(InventoryDragEvent event) {
