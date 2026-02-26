@@ -76,6 +76,11 @@ public class CoinShop extends JavaPlugin implements Listener {
     // Pending item returns for offline players
     private final Map<UUID, List<ItemStack>> pendingItemReturns = new ConcurrentHashMap<>();
 
+    // Cache temporário para evitar chamadas repetidas à API (apenas em memória)
+    private final Map<UUID, String> cardCache = new ConcurrentHashMap<>();
+    private final Map<UUID, Long> cardCacheTimestamp = new ConcurrentHashMap<>();
+    private static final long CACHE_DURATION = 5 * 60 * 1000; // 5 minutos
+
     // ====================================================
     // ON ENABLE / DISABLE
     // ====================================================
@@ -122,6 +127,8 @@ public class CoinShop extends JavaPlugin implements Listener {
         }
         saveStoreData();
         savePendingReturns();
+        cardCache.clear();
+        cardCacheTimestamp.clear();
         getLogger().info("CoinShop disabled.");
     }
 
@@ -187,7 +194,6 @@ public class CoinShop extends JavaPlugin implements Listener {
             try {
                 YamlConfiguration example = new YamlConfiguration();
                 example.set("Name", "Example Shop");
-                example.set("Card", "CARD_ID_HERE");
                 example.save(exampleFile);
                 getLogger().info("Created example user file: " + exampleFile.getName());
             } catch (IOException e) {
@@ -223,7 +229,6 @@ public class CoinShop extends JavaPlugin implements Listener {
                             }
                         }
                         
-                        String sellerCardId = itemObj.has("sellerCardId") ? itemObj.get("sellerCardId").getAsString() : "";
                         String sellerName = itemObj.has("sellerName") ? itemObj.get("sellerName").getAsString() : "";
                         String sellerShopName = itemObj.has("sellerShopName") ? itemObj.get("sellerShopName").getAsString() : "";
                         
@@ -245,8 +250,9 @@ public class CoinShop extends JavaPlugin implements Listener {
                         long listedAt = itemObj.has("listedAt") ? itemObj.get("listedAt").getAsLong() : System.currentTimeMillis();
                         
                         if (sellerUuid != null && item != null) {
+                            // Não armazenamos mais sellerCardId - será obtido da API quando necessário
                             ShopItem shopItem = new ShopItem(
-                                transactionId, sellerUuid, sellerCardId, sellerName, sellerShopName, item, price, listedAt
+                                transactionId, sellerUuid, sellerName, sellerShopName, item, price, listedAt
                             );
                             storeData.items.add(shopItem);
                         }
@@ -287,7 +293,6 @@ public class CoinShop extends JavaPlugin implements Listener {
                 if (shopItem.sellerUuid != null) {
                     itemObj.addProperty("sellerUuid", shopItem.sellerUuid.toString());
                 }
-                itemObj.addProperty("sellerCardId", shopItem.sellerCardId);
                 itemObj.addProperty("sellerName", shopItem.sellerName);
                 itemObj.addProperty("sellerShopName", shopItem.sellerShopName);
                 
@@ -395,7 +400,7 @@ public class CoinShop extends JavaPlugin implements Listener {
     }
 
     // ====================================================
-    // PLAYER DATA
+    // PLAYER DATA (APENAS NOME DA LOJA)
     // ====================================================
     private PlayerData getPlayerData(UUID uuid) {
         if (uuid == null) {
@@ -411,9 +416,8 @@ public class CoinShop extends JavaPlugin implements Listener {
             name = (offlinePlayer.getName() != null ? offlinePlayer.getName() : "Unknown") + "'s shop";
         }
 
-        String card = yamlConfig.getString("Card", "");
-
-        return new PlayerData(uuid, name, card, playerFile);
+        // NÃO ARMAZENAMOS MAIS CARD ID - será obtido da API quando necessário
+        return new PlayerData(uuid, name, playerFile);
     }
 
     private void savePlayerData(PlayerData data) {
@@ -428,7 +432,6 @@ public class CoinShop extends JavaPlugin implements Listener {
             
             YamlConfiguration yamlConfig = new YamlConfiguration();
             yamlConfig.set("Name", data.shopName);
-            yamlConfig.set("Card", data.cardId);
             yamlConfig.save(data.file);
         } catch (IOException e) {
             getLogger().log(Level.WARNING, "Failed to save player data for " + data.uuid, e);
@@ -436,8 +439,77 @@ public class CoinShop extends JavaPlugin implements Listener {
     }
 
     // ====================================================
-    // COINCARD API COMMUNICATION
+    // COINCARD API COMMUNICATION (VIA API DO PLUGIN)
     // ====================================================
+    
+    /**
+     * Obtém o card ID de um jogador usando a API do CoinCard
+     */
+    private String getPlayerCardId(UUID uuid) {
+        if (uuid == null) return null;
+        
+        // Verificar cache primeiro
+        Long cachedTime = cardCacheTimestamp.get(uuid);
+        if (cachedTime != null && (System.currentTimeMillis() - cachedTime) < CACHE_DURATION) {
+            String cached = cardCache.get(uuid);
+            if (cached != null) return cached;
+        }
+        
+        // Chamar a API para obter o card
+        String cardId = coinCardAPI.getPlayerCard(uuid);
+        
+        // Atualizar cache
+        if (cardId != null && !cardId.isEmpty()) {
+            cardCache.put(uuid, cardId);
+            cardCacheTimestamp.put(uuid, System.currentTimeMillis());
+        }
+        
+        return cardId;
+    }
+    
+    /**
+     * Obtém o card ID de um jogador pelo nome (offline)
+     */
+    private String getPlayerCardIdByNick(String nick) {
+        if (nick == null || nick.isEmpty()) return null;
+        
+        // Primeiro tenta encontrar online
+        Player player = Bukkit.getPlayerExact(nick);
+        if (player != null) {
+            return getPlayerCardId(player.getUniqueId());
+        }
+        
+        // Se não estiver online, usa a API diretamente
+        return coinCardAPI.getPlayerCardByNick(nick);
+    }
+    
+    /**
+     * Verifica se um jogador tem card configurado
+     */
+    private boolean hasPlayerCard(UUID uuid) {
+        if (uuid == null) return false;
+        
+        // Verificar cache primeiro
+        if (cardCache.containsKey(uuid)) {
+            String cached = cardCache.get(uuid);
+            return cached != null && !cached.isEmpty();
+        }
+        
+        // Chamar a API
+        boolean hasCard = coinCardAPI.hasCard(uuid);
+        
+        // Se tiver card, atualizar cache
+        if (hasCard) {
+            String cardId = coinCardAPI.getPlayerCard(uuid);
+            if (cardId != null && !cardId.isEmpty()) {
+                cardCache.put(uuid, cardId);
+                cardCacheTimestamp.put(uuid, System.currentTimeMillis());
+            }
+        }
+        
+        return hasCard;
+    }
+
     private void transferWithCoinCard(String fromCard, String toCard, BigDecimal amount, 
                                        Transaction transaction, PendingPurchase purchase) {
         if (fromCard == null || toCard == null || amount == null || transaction == null || purchase == null) {
@@ -681,13 +753,12 @@ public class CoinShop extends JavaPlugin implements Listener {
         // Get seller's data
         PlayerData sellerData = purchase.sellerUuid != null ? getPlayerData(purchase.sellerUuid) : null;
         
-        // Recreate the item in the shop
+        // Recreate the item in the shop - não armazenamos mais card ID
         for (ItemStack item : purchase.items) {
             if (item != null) {
                 ShopItem shopItem = new ShopItem(
                     transaction.id,
                     purchase.sellerUuid,
-                    transaction.toCard,
                     sellerData != null ? sellerData.shopName : "Unknown",
                     sellerData != null ? sellerData.shopName : "Unknown",
                     item,
@@ -738,17 +809,18 @@ public class CoinShop extends JavaPlugin implements Listener {
             return false;
         }
 
-        PlayerData data = getPlayerData(player.getUniqueId());
-        if (data == null || data.cardId == null || data.cardId.isEmpty()) {
-            player.sendMessage(ChatColor.RED + "You don't have a card ID set! Please contact an administrator.");
+        // Verificar se o jogador tem card usando a API
+        if (!hasPlayerCard(player.getUniqueId())) {
+            player.sendMessage(ChatColor.RED + "You don't have a card set! Use /coin card <card> to set your card.");
             return false;
         }
 
         String transactionId = UUID.randomUUID().toString();
+        PlayerData data = getPlayerData(player.getUniqueId());
+        
         ShopItem shopItem = new ShopItem(
                 transactionId,
                 player.getUniqueId(),
-                data.cardId,
                 player.getName(),
                 data.shopName != null ? data.shopName : player.getName() + "'s shop",
                 item.clone(),
@@ -773,9 +845,43 @@ public class CoinShop extends JavaPlugin implements Listener {
             return false;
         }
 
-        PlayerData buyerData = getPlayerData(buyer.getUniqueId());
-        if (buyerData == null || buyerData.cardId == null || buyerData.cardId.isEmpty()) {
-            buyer.sendMessage(ChatColor.RED + "You don't have a card ID set! Please contact an administrator.");
+        // Verificar se o comprador tem card usando a API
+        if (!hasPlayerCard(buyer.getUniqueId())) {
+            buyer.sendMessage(ChatColor.RED + "You don't have a card set! Use /coin card <card> to set your card.");
+            return false;
+        }
+
+        // Verificar se o vendedor tem card usando a API
+        String sellerCardId = getPlayerCardId(item.sellerUuid);
+        if (sellerCardId == null || sellerCardId.isEmpty()) {
+            buyer.sendMessage(ChatColor.RED + "The seller doesn't have a card set! This item cannot be purchased.");
+            
+            // Remover item da loja
+            storeData.items.remove(item);
+            saveStoreData();
+            
+            // Tentar devolver ao vendedor se online
+            Player seller = Bukkit.getPlayer(item.sellerUuid);
+            if (seller != null && seller.isOnline()) {
+                HashMap<Integer, ItemStack> leftover = seller.getInventory().addItem(item.item.clone());
+                if (!leftover.isEmpty()) {
+                    World world = seller.getWorld();
+                    Location loc = seller.getLocation();
+                    for (ItemStack drop : leftover.values()) {
+                        if (drop != null) {
+                            world.dropItemNaturally(loc, drop);
+                        }
+                    }
+                    seller.sendMessage(ChatColor.YELLOW + "Some items were dropped because your inventory was full!");
+                }
+                seller.sendMessage(ChatColor.RED + "Your listing was removed because you don't have a card set!");
+            } else {
+                // Store items for later return
+                pendingItemReturns.computeIfAbsent(item.sellerUuid, k -> new ArrayList<>())
+                        .add(item.item.clone());
+                savePendingReturns();
+            }
+            
             return false;
         }
 
@@ -795,11 +901,17 @@ public class CoinShop extends JavaPlugin implements Listener {
                     return;
                 }
 
+                String buyerCardId = getPlayerCardId(buyer.getUniqueId());
+                if (buyerCardId == null || buyerCardId.isEmpty()) {
+                    buyer.sendMessage(ChatColor.RED + "Error: Could not retrieve your card ID!");
+                    return;
+                }
+
                 String transactionId = UUID.randomUUID().toString();
                 Transaction transaction = new Transaction(
                         transactionId,
-                        buyerData.cardId,
-                        item.sellerCardId,
+                        buyerCardId,
+                        sellerCardId,
                         totalPrice
                 );
 
@@ -1625,6 +1737,10 @@ private void handleAdminCancel(Player admin, ItemStack clickedItem, ShopInventor
     public void onPlayerJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
         returnPendingItems(player);
+        
+        // Limpar cache do jogador ao entrar (opcional)
+        cardCache.remove(player.getUniqueId());
+        cardCacheTimestamp.remove(player.getUniqueId());
     }
 
     // ====================================================
@@ -1758,9 +1874,9 @@ private void handleAdminCancel(Player admin, ItemStack clickedItem, ShopInventor
         private void checkPlayerBalanceCommand(Player player) {
             if (player == null) return;
             
-            PlayerData data = getPlayerData(player.getUniqueId());
-            if (data == null || data.cardId == null || data.cardId.isEmpty()) {
-                player.sendMessage(ChatColor.RED + "You don't have a card ID set! Please contact an administrator.");
+            // Verificar se o jogador tem card usando a API
+            if (!hasPlayerCard(player.getUniqueId())) {
+                player.sendMessage(ChatColor.RED + "You don't have a card set! Use /coin card <card> to set your card.");
                 return;
             }
 
@@ -1807,18 +1923,16 @@ private void handleAdminCancel(Player admin, ItemStack clickedItem, ShopInventor
     private static class ShopItem {
         String transactionId;
         UUID sellerUuid;
-        String sellerCardId;
         String sellerName;
         String sellerShopName;
         ItemStack item;
         BigDecimal price;
         long listedAt;
 
-        ShopItem(String transactionId, UUID sellerUuid, String sellerCardId, String sellerName,
+        ShopItem(String transactionId, UUID sellerUuid, String sellerName,
                  String sellerShopName, ItemStack item, BigDecimal price, long listedAt) {
             this.transactionId = transactionId;
             this.sellerUuid = sellerUuid;
-            this.sellerCardId = sellerCardId;
             this.sellerName = sellerName;
             this.sellerShopName = sellerShopName;
             this.item = item;
@@ -1864,13 +1978,11 @@ private void handleAdminCancel(Player admin, ItemStack clickedItem, ShopInventor
     private static class PlayerData {
         UUID uuid;
         String shopName;
-        String cardId;
         File file;
 
-        PlayerData(UUID uuid, String shopName, String cardId, File file) {
+        PlayerData(UUID uuid, String shopName, File file) {
             this.uuid = uuid;
             this.shopName = shopName;
-            this.cardId = cardId;
             this.file = file;
         }
     }
