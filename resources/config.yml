@@ -1,6 +1,6 @@
 # CoinShop Configuration
 # Server Card ID for collecting taxes
-Server: ""
+Server: "e1301fadfc35"
 
 # Tax rate (0.1 = 10%)
 Tax: 0.1

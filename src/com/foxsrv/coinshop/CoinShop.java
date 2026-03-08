@@ -1829,6 +1829,11 @@ private void handleAdminCancel(Player admin, ItemStack clickedItem, ShopInventor
             }
         }
 
+        /**
+         * Processa o comando /cshop sell com suporte a dois formatos:
+         * - Formato decimal: /cshop sell 1 0.0015
+         * - Formato inteiro: /cshop sell 1 150 (converte para 0.00000150)
+         */
         private void handleSellCommand(Player player, String[] args) {
             if (player == null || args == null || args.length < 3) return;
             
@@ -1851,15 +1856,36 @@ private void handleAdminCancel(Player admin, ItemStack clickedItem, ShopInventor
             }
 
             BigDecimal price;
+            String priceStr = args[2].replace(',', '.');
+            
             try {
-                price = new BigDecimal(args[2].replace(',', '.'));
+                // Verificar se o preço contém ponto decimal (formato decimal)
+                if (priceStr.contains(".")) {
+                    // Formato decimal: usar diretamente
+                    price = new BigDecimal(priceStr);
+                } else {
+                    // Formato inteiro: converter para 0.000(inteiro com 8 casas decimais)
+                    // Exemplo: 150 -> 0.00000150
+                    long intValue = Long.parseLong(priceStr);
+                    if (intValue <= 0) {
+                        player.sendMessage(ChatColor.RED + "Price must be positive!");
+                        return;
+                    }
+                    // Converter para BigDecimal dividindo por 100.000.000 (10^8)
+                    price = BigDecimal.valueOf(intValue).divide(BigDecimal.valueOf(100_000_000), 8, RoundingMode.DOWN);
+                }
+                
+                // Validar se o preço é positivo
                 if (price.compareTo(BigDecimal.ZERO) <= 0) {
                     player.sendMessage(ChatColor.RED + "Price must be positive!");
                     return;
                 }
+                
+                // Garantir 8 casas decimais
                 price = price.setScale(8, RoundingMode.DOWN);
+                
             } catch (NumberFormatException e) {
-                player.sendMessage(ChatColor.RED + "Invalid price format! Use numbers like 1.5 or 0.001");
+                player.sendMessage(ChatColor.RED + "Invalid price format! Use numbers like 1.5, 0.001, or 150");
                 return;
             }
 
@@ -1869,6 +1895,9 @@ private void handleAdminCancel(Player admin, ItemStack clickedItem, ShopInventor
             player.getInventory().setItemInMainHand(item);
 
             createListing(player, sellItem, price);
+            
+            // Mostrar o preço formatado para o jogador
+            player.sendMessage(ChatColor.GRAY + "Price set to: " + ChatColor.GREEN + formatCoin(price));
         }
 
         private void checkPlayerBalanceCommand(Player player) {
