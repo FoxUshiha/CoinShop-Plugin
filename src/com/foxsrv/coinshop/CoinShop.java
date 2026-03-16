@@ -81,6 +81,10 @@ public class CoinShop extends JavaPlugin implements Listener {
     private final Map<UUID, Long> cardCacheTimestamp = new ConcurrentHashMap<>();
     private static final long CACHE_DURATION = 5 * 60 * 1000; // 5 minutos
 
+    // Map para controlar cooldown de compras por jogador
+    private final Map<UUID, Long> playerPurchaseCooldown = new ConcurrentHashMap<>();
+    private static final long PURCHASE_COOLDOWN = 1000; // 1 segundo
+
     // ====================================================
     // ON ENABLE / DISABLE
     // ====================================================
@@ -250,7 +254,6 @@ public class CoinShop extends JavaPlugin implements Listener {
                         long listedAt = itemObj.has("listedAt") ? itemObj.get("listedAt").getAsLong() : System.currentTimeMillis();
                         
                         if (sellerUuid != null && item != null) {
-                            // Não armazenamos mais sellerCardId - será obtido da API quando necessário
                             ShopItem shopItem = new ShopItem(
                                 transactionId, sellerUuid, sellerName, sellerShopName, item, price, listedAt
                             );
@@ -416,7 +419,6 @@ public class CoinShop extends JavaPlugin implements Listener {
             name = (offlinePlayer.getName() != null ? offlinePlayer.getName() : "Unknown") + "'s shop";
         }
 
-        // NÃO ARMAZENAMOS MAIS CARD ID - será obtido da API quando necessário
         return new PlayerData(uuid, name, playerFile);
     }
 
@@ -663,16 +665,16 @@ public class CoinShop extends JavaPlugin implements Listener {
             
             // Send sale success message ONLY to the seller (shop owner)
             if (seller != null && seller.isOnline()) {
-                seller.sendMessage(ChatColor.GREEN + "✦ " + ChatColor.GOLD + "ITEM SOLD! " + ChatColor.GREEN + "✦");
-                seller.sendMessage(ChatColor.GRAY + "Item: " + ChatColor.WHITE + purchase.items.get(0).getAmount() + "x " + itemName);
-                seller.sendMessage(ChatColor.GRAY + "Buyer: " + ChatColor.WHITE + (buyer != null ? buyer.getName() : "Unknown"));
-                seller.sendMessage(ChatColor.GRAY + "Price: " + ChatColor.GREEN + formatCoin(purchase.price));
+                seller.sendMessage("§a✦ §6ITEM SOLD! §a✦");
+                seller.sendMessage("§7Item: §f" + purchase.items.get(0).getAmount() + "x " + itemName);
+                seller.sendMessage("§7Buyer: §f" + (buyer != null ? buyer.getName() : "Unknown"));
+                seller.sendMessage("§7Price: §a" + formatCoin(purchase.price));
                 if (taxRate > 0) {
-                    seller.sendMessage(ChatColor.GRAY + "Tax (" + (taxRate * 100) + "%): " + ChatColor.RED + "-" + formatCoin(taxAmount));
-                    seller.sendMessage(ChatColor.GRAY + "You received: " + ChatColor.GREEN + formatCoin(sellerAmount));
+                    seller.sendMessage("§7Tax (" + (taxRate * 100) + "%): §c-" + formatCoin(taxAmount));
+                    seller.sendMessage("§7You received: §a" + formatCoin(sellerAmount));
                 }
-                seller.sendMessage(ChatColor.GRAY + "Transaction: " + ChatColor.WHITE + (txId != null ? txId.substring(0, 8) + "..." : "unknown"));
-                seller.sendMessage(ChatColor.GREEN + "The amount has been credited to your card!");
+                seller.sendMessage("§7Transaction: §f" + (txId != null ? txId.substring(0, 8) + "..." : "unknown"));
+                seller.sendMessage("§aThe amount has been credited to your card!");
             }
 
             // Give items to buyer
@@ -688,11 +690,11 @@ public class CoinShop extends JavaPlugin implements Listener {
                                     world.dropItemNaturally(loc, drop);
                                 }
                             }
-                            buyer.sendMessage(ChatColor.YELLOW + "Some items were dropped because your inventory was full!");
+                            buyer.sendMessage("§eSome items were dropped because your inventory was full!");
                         }
                     }
                 }
-                buyer.sendMessage(ChatColor.GREEN + "Your purchase of " + formatCoin(transaction.amount) +
+                buyer.sendMessage("§aYour purchase of " + formatCoin(transaction.amount) +
                         " coins has been completed! Transaction ID: " + (txId != null ? txId.substring(0, 8) + "..." : "unknown"));
             }
         }
@@ -706,6 +708,14 @@ public class CoinShop extends JavaPlugin implements Listener {
         pendingPurchases.remove(transaction.id);
         storeData.items.removeIf(item -> item != null && item.transactionId != null && item.transactionId.equals(transaction.id));
         saveStoreData();
+        
+        // Atualizar todas as lojas abertas após 1 segundo
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                refreshAllOpenShops();
+            }
+        }.runTaskLater(this, 20L); // 1 segundo = 20 ticks
     }
 
     private void processTaxTransaction(String fromCard, BigDecimal taxAmount, String originalTxId) {
@@ -746,7 +756,7 @@ public class CoinShop extends JavaPlugin implements Listener {
         // Get seller's data
         PlayerData sellerData = purchase.sellerUuid != null ? getPlayerData(purchase.sellerUuid) : null;
         
-        // Recreate the item in the shop - não armazenamos mais card ID
+        // Recreate the item in the shop
         for (ItemStack item : purchase.items) {
             if (item != null) {
                 ShopItem shopItem = new ShopItem(
@@ -766,8 +776,8 @@ public class CoinShop extends JavaPlugin implements Listener {
         saveStoreData();
 
         if (buyer != null && buyer.isOnline()) {
-            buyer.sendMessage(ChatColor.RED + "[FAILED] Transaction failed: " + (error != null ? error : "Unknown error"));
-            buyer.sendMessage(ChatColor.YELLOW + "The item has been returned to the shop. You were not charged.");
+            buyer.sendMessage("§c[FAILED] Transaction failed: " + (error != null ? error : "Unknown error"));
+            buyer.sendMessage("§eThe item has been returned to the shop. You were not charged.");
         }
 
         // Notify the seller about the failure
@@ -778,14 +788,17 @@ public class CoinShop extends JavaPlugin implements Listener {
                 itemName = purchase.items.get(0).getItemMeta().getDisplayName();
             }
             
-            seller.sendMessage(ChatColor.RED + "[FAILED] " + ChatColor.YELLOW + "SALE FAILED!");
-            seller.sendMessage(ChatColor.GRAY + "Item: " + ChatColor.WHITE + purchase.items.get(0).getAmount() + "x " + itemName);
-            seller.sendMessage(ChatColor.GRAY + "Reason: " + ChatColor.RED + (error != null ? error : "Unknown error"));
-            seller.sendMessage(ChatColor.GREEN + "The item has been returned to your shop inventory.");
+            seller.sendMessage("§c[FAILED] §eSALE FAILED!");
+            seller.sendMessage("§7Item: §f" + purchase.items.get(0).getAmount() + "x " + itemName);
+            seller.sendMessage("§7Reason: §c" + (error != null ? error : "Unknown error"));
+            seller.sendMessage("§aThe item has been returned to your shop inventory.");
         }
 
         pendingPurchases.remove(transaction.id);
         saveStoreData();
+        
+        // Atualizar todas as lojas abertas
+        refreshAllOpenShops();
     }
 
     // ====================================================
@@ -797,14 +810,14 @@ public class CoinShop extends JavaPlugin implements Listener {
         }
         
         if (price.compareTo(minPrice) < 0 || price.compareTo(maxPrice) > 0) {
-            player.sendMessage(ChatColor.RED + "Price must be between " + formatCoin(minPrice) +
+            player.sendMessage("§cPrice must be between " + formatCoin(minPrice) +
                     " and " + formatCoin(maxPrice));
             return false;
         }
 
         // Verificar se o jogador tem card usando a API
         if (!hasPlayerCard(player.getUniqueId())) {
-            player.sendMessage(ChatColor.RED + "You don't have a card set! Use /coin card <card> to set your card.");
+            player.sendMessage("§cYou don't have a card set! Use /coin card <card> to set your card.");
             return false;
         }
 
@@ -833,17 +846,17 @@ public class CoinShop extends JavaPlugin implements Listener {
         BigDecimal totalWithTax = price.add(price.multiply(BigDecimal.valueOf(taxRate)))
                 .setScale(8, RoundingMode.DOWN);
         
-        String announcement = ChatColor.GOLD + "✦ " + ChatColor.GREEN + "NEW LISTING " + ChatColor.GOLD + "✦\n" +
-                ChatColor.YELLOW + (data.shopName != null ? data.shopName : player.getName() + "'s shop") + 
-                ChatColor.GRAY + " is selling " + 
-                ChatColor.AQUA + item.getAmount() + "x " + itemName + "\n" +
-                ChatColor.GRAY + "Price: " + ChatColor.GREEN + formatCoin(price) + 
-                ChatColor.GRAY + " (Total with " + (int)(taxRate * 100) + "% tax: " + 
-                ChatColor.YELLOW + formatCoin(totalWithTax) + ChatColor.GRAY + ")";
+        String announcement = "§6✦ §aNEW LISTING §6✦\n" +
+                "§e" + (data.shopName != null ? data.shopName : player.getName() + "'s shop") + 
+                "§7 is selling " + 
+                "§b" + item.getAmount() + "x " + itemName + "\n" +
+                "§7Price: §a" + formatCoin(price) + 
+                "§7 (Total with " + (int)(taxRate * 100) + "% tax: " + 
+                "§e" + formatCoin(totalWithTax) + "§7)";
         
         Bukkit.broadcastMessage(announcement);
 
-        player.sendMessage(ChatColor.GREEN + "✓ Item listed for sale at " + formatCoin(price) + " coins!");
+        player.sendMessage("§a✓ Item listed for sale at " + formatCoin(price) + " coins!");
         return true;
     }
 
@@ -852,21 +865,30 @@ public class CoinShop extends JavaPlugin implements Listener {
             return false;
         }
         
+        // Verificar cooldown de compra
+        Long lastPurchase = playerPurchaseCooldown.get(buyer.getUniqueId());
+        long now = System.currentTimeMillis();
+        if (lastPurchase != null && (now - lastPurchase) < PURCHASE_COOLDOWN) {
+            return false; // Silenciosamente ignorar cliques muito rápidos
+        }
+        
+        // Verificar se o item ainda está disponível
         if (!storeData.items.contains(item)) {
-            buyer.sendMessage(ChatColor.RED + "This item is no longer available!");
+            buyer.sendMessage("§cThis item is no longer available!");
+            refreshPlayerShop(buyer); // Atualizar a loja do jogador
             return false;
         }
 
         // Verificar se o comprador tem card usando a API
         if (!hasPlayerCard(buyer.getUniqueId())) {
-            buyer.sendMessage(ChatColor.RED + "You don't have a card set! Use /coin card <card> to set your card.");
+            buyer.sendMessage("§cYou don't have a card set! Use /coin card <card> to set your card.");
             return false;
         }
 
         // Verificar se o vendedor tem card usando a API
         String sellerCardId = getPlayerCardId(item.sellerUuid);
         if (sellerCardId == null || sellerCardId.isEmpty()) {
-            buyer.sendMessage(ChatColor.RED + "The seller doesn't have a card set! This item cannot be purchased.");
+            buyer.sendMessage("§cThe seller doesn't have a card set! This item cannot be purchased.");
             
             // Remover item da loja
             storeData.items.remove(item);
@@ -884,9 +906,9 @@ public class CoinShop extends JavaPlugin implements Listener {
                             world.dropItemNaturally(loc, drop);
                         }
                     }
-                    seller.sendMessage(ChatColor.YELLOW + "Some items were dropped because your inventory was full!");
+                    seller.sendMessage("§eSome items were dropped because your inventory was full!");
                 }
-                seller.sendMessage(ChatColor.RED + "Your listing was removed because you don't have a card set!");
+                seller.sendMessage("§cYour listing was removed because you don't have a card set!");
             } else {
                 // Store items for later return
                 pendingItemReturns.computeIfAbsent(item.sellerUuid, k -> new ArrayList<>())
@@ -894,6 +916,7 @@ public class CoinShop extends JavaPlugin implements Listener {
                 savePendingReturns();
             }
             
+            refreshPlayerShop(buyer);
             return false;
         }
 
@@ -908,14 +931,14 @@ public class CoinShop extends JavaPlugin implements Listener {
                 }
 
                 if (balance.compareTo(totalPrice) < 0) {
-                    buyer.sendMessage(ChatColor.RED + "Insufficient balance! You need " + 
+                    buyer.sendMessage("§cInsufficient balance! You need " + 
                             formatCoin(totalPrice) + " but have " + formatCoin(balance));
                     return;
                 }
 
                 String buyerCardId = getPlayerCardId(buyer.getUniqueId());
                 if (buyerCardId == null || buyerCardId.isEmpty()) {
-                    buyer.sendMessage(ChatColor.RED + "Error: Could not retrieve your card ID!");
+                    buyer.sendMessage("§cError: Could not retrieve your card ID!");
                     return;
                 }
 
@@ -940,16 +963,58 @@ public class CoinShop extends JavaPlugin implements Listener {
                 saveStoreData();
                 transactionQueue.add(transaction);
 
-                buyer.sendMessage(ChatColor.YELLOW + "Purchase queued! You will receive your items once the transaction completes.");
+                // Atualizar cooldown
+                playerPurchaseCooldown.put(buyer.getUniqueId(), System.currentTimeMillis());
+                
+                buyer.sendMessage("§ePurchase queued! You will receive your items once the transaction completes.");
+                
+                // Atualizar a loja do comprador imediatamente
+                refreshPlayerShop(buyer);
             }
 
             @Override
             public void onFailure(String error) {
-                buyer.sendMessage(ChatColor.RED + "Failed to check balance: " + (error != null ? error : "Unknown error"));
+                buyer.sendMessage("§cFailed to check balance: " + (error != null ? error : "Unknown error"));
             }
         });
 
         return true;
+    }
+
+    private void refreshAllOpenShops() {
+        for (Player player : Bukkit.getOnlinePlayers()) {
+            refreshPlayerShop(player);
+        }
+    }
+    
+    private void refreshPlayerShop(Player player) {
+        if (player == null || !player.isOnline()) return;
+        
+        Inventory openInv = player.getOpenInventory().getTopInventory();
+        if (openInv.getHolder() instanceof ShopInventoryHolder) {
+            ShopInventoryHolder holder = (ShopInventoryHolder) openInv.getHolder();
+            
+            // Recriar o inventário baseado no tipo atual
+            switch (holder.getType()) {
+                case MAIN_MENU:
+                    player.openInventory(buildMainMenu(player));
+                    break;
+                case CATEGORIES_MENU:
+                    player.openInventory(buildCategoriesMenu(player));
+                    break;
+                case CATEGORY_SHOP:
+                    if (holder.getCategory() != null) {
+                        player.openInventory(buildCategoryShopMenu(player, holder.getCategory(), holder.getPage()));
+                    }
+                    break;
+                case MY_SHOP:
+                    player.openInventory(buildMyShopMenu(player, holder.getPage()));
+                    break;
+                case GLOBAL_SHOP:
+                    player.openInventory(buildGlobalShopMenu(player, holder.getPage()));
+                    break;
+            }
+        }
     }
 
     private boolean cancelListing(Player player, ShopItem item) {
@@ -958,7 +1023,7 @@ public class CoinShop extends JavaPlugin implements Listener {
         }
         
         if (!item.sellerUuid.equals(player.getUniqueId()) && !player.hasPermission("coinshop.admin")) {
-            player.sendMessage(ChatColor.RED + "This is not your item to cancel!");
+            player.sendMessage("§cThis is not your item to cancel!");
             return false;
         }
 
@@ -975,22 +1040,23 @@ public class CoinShop extends JavaPlugin implements Listener {
                             world.dropItemNaturally(loc, drop);
                         }
                     }
-                    seller.sendMessage(ChatColor.YELLOW + "Some items were dropped because your inventory was full!");
+                    seller.sendMessage("§eSome items were dropped because your inventory was full!");
                 }
-                seller.sendMessage(ChatColor.GREEN + "Your item has been returned to you.");
+                seller.sendMessage("§aYour item has been returned to you.");
             } else {
                 // Store items for later return
                 pendingItemReturns.computeIfAbsent(item.sellerUuid, k -> new ArrayList<>())
                         .add(item.item.clone());
                 savePendingReturns();
-                player.sendMessage(ChatColor.GREEN + "Item removed from shop. It will be returned when the seller comes online.");
+                player.sendMessage("§aItem removed from shop. It will be returned when the seller comes online.");
             }
 
             saveStoreData();
+            refreshAllOpenShops();
             return true;
         }
 
-        player.sendMessage(ChatColor.RED + "Item no longer exists in shop!");
+        player.sendMessage("§cItem no longer exists in shop!");
         return false;
     }
 
@@ -1009,7 +1075,7 @@ public class CoinShop extends JavaPlugin implements Listener {
                     }
                 }
             }
-            player.sendMessage(ChatColor.GREEN + "You have received " + items.size() + 
+            player.sendMessage("§aYou have received " + items.size() + 
                     " item(s) that were removed from the shop while you were offline.");
             savePendingReturns();
         }
@@ -1187,34 +1253,34 @@ public class CoinShop extends JavaPlugin implements Listener {
             player.getUniqueId()
         );
         
-        Inventory inv = Bukkit.createInventory(holder, 27, ChatColor.BLUE + "CoinShop");
+        Inventory inv = Bukkit.createInventory(holder, 27, "§9CoinShop");
 
         ItemStack myShop = new ItemStack(Material.CHEST);
         ItemMeta myShopMeta = myShop.getItemMeta();
-        myShopMeta.setDisplayName(ChatColor.GREEN + "My Shop");
+        myShopMeta.setDisplayName("§aMy Shop");
         myShopMeta.setLore(Arrays.asList(
-                ChatColor.GRAY + "Manage your own shop",
-                ChatColor.GRAY + "Sell items and cancel listings"
+                "§7Manage your own shop",
+                "§7Sell items and cancel listings"
         ));
         myShop.setItemMeta(myShopMeta);
         inv.setItem(11, myShop);
 
         ItemStack categories = new ItemStack(Material.BOOKSHELF);
         ItemMeta categoriesMeta = categories.getItemMeta();
-        categoriesMeta.setDisplayName(ChatColor.GOLD + "Categories");
+        categoriesMeta.setDisplayName("§6Categories");
         categoriesMeta.setLore(Arrays.asList(
-                ChatColor.GRAY + "Browse items by category",
-                ChatColor.GRAY + "Tools, Food, Blocks, etc."
+                "§7Browse items by category",
+                "§7Tools, Food, Blocks, etc."
         ));
         categories.setItemMeta(categoriesMeta);
         inv.setItem(13, categories);
 
         ItemStack globalShop = new ItemStack(Material.EMERALD);
         ItemMeta globalMeta = globalShop.getItemMeta();
-        globalMeta.setDisplayName(ChatColor.GREEN + "Global Shop");
+        globalMeta.setDisplayName("§aGlobal Shop");
         globalMeta.setLore(Arrays.asList(
-                ChatColor.GRAY + "Browse all items",
-                ChatColor.GRAY + "from all players"
+                "§7Browse all items",
+                "§7from all players"
         ));
         globalShop.setItemMeta(globalMeta);
         inv.setItem(15, globalShop);
@@ -1241,16 +1307,22 @@ public class CoinShop extends JavaPlugin implements Listener {
             player.getUniqueId()
         );
         
-        Inventory inv = Bukkit.createInventory(holder, 54, ChatColor.GOLD + "Shop Categories");
+        Inventory inv = Bukkit.createInventory(holder, 54, "§6Shop Categories");
 
-        int slot = 0;
+        int slot = 10; // Começar do slot 10 para melhor organização
         for (ItemCategory category : ItemCategory.values()) {
+            // Pular slots indesejados
+            while (slot % 9 == 0 || slot % 9 == 8 || slot == 17 || slot == 18 || 
+                   slot == 26 || slot == 27 || slot == 35 || slot == 36 || slot == 44) {
+                slot++;
+            }
+            
             ItemStack categoryItem = new ItemStack(category.getIcon());
             ItemMeta meta = categoryItem.getItemMeta();
-            meta.setDisplayName(ChatColor.GOLD + category.getDisplayName());
+            meta.setDisplayName("§6" + category.getDisplayName());
             
             List<String> lore = new ArrayList<>();
-            lore.add(ChatColor.GRAY + category.getDescription());
+            lore.add("§7" + category.getDescription());
             
             long itemCount = storeData.items.stream()
                     .filter(item -> item != null && item.item != null)
@@ -1258,27 +1330,27 @@ public class CoinShop extends JavaPlugin implements Listener {
                            ItemCategory.fromMaterial(item.item.getType()) == category)
                     .count();
             
-            lore.add(ChatColor.GREEN + "Items: " + ChatColor.WHITE + itemCount);
+            lore.add("§aItems: §f" + itemCount);
             meta.setLore(lore);
             
             categoryItem.setItemMeta(meta);
             inv.setItem(slot++, categoryItem);
-            
-            if (slot % 9 == 0) slot++;
         }
 
-        ItemStack back = new ItemStack(Material.BARRIER);
+        // Botão voltar para o menu principal
+        ItemStack back = new ItemStack(Material.ARROW);
         ItemMeta backMeta = back.getItemMeta();
-        backMeta.setDisplayName(ChatColor.RED + "Back to Main Menu");
+        backMeta.setDisplayName("§aBack to Main Menu");
         back.setItemMeta(backMeta);
         inv.setItem(49, back);
 
+        // Preencher bordas com vidro
         ItemStack filler = new ItemStack(Material.GRAY_STAINED_GLASS_PANE);
         ItemMeta fillerMeta = filler.getItemMeta();
         fillerMeta.setDisplayName(" ");
         filler.setItemMeta(fillerMeta);
 
-        for (int i = 45; i < 54; i++) {
+        for (int i = 0; i < 54; i++) {
             if (inv.getItem(i) == null) {
                 inv.setItem(i, filler);
             }
@@ -1302,7 +1374,7 @@ public class CoinShop extends JavaPlugin implements Listener {
             player.getUniqueId()
         );
         
-        String title = ChatColor.GOLD + category.getDisplayName() + " - Page " + (page + 1);
+        String title = "§6" + category.getDisplayName() + " - Page " + (page + 1);
         return buildShopInventory(categoryItems, page, title, holder, false);
     }
 
@@ -1319,7 +1391,7 @@ public class CoinShop extends JavaPlugin implements Listener {
             player.getUniqueId()
         );
         
-        String title = ChatColor.GREEN + "My Shop - Page " + (page + 1);
+        String title = "§aMy Shop - Page " + (page + 1);
         return buildShopInventory(myItems, page, title, holder, true);
     }
 
@@ -1336,7 +1408,7 @@ public class CoinShop extends JavaPlugin implements Listener {
             player.getUniqueId()
         );
         
-        String title = ChatColor.GREEN + "Global Shop - Page " + (page + 1);
+        String title = "§aGlobal Shop - Page " + (page + 1);
         return buildShopInventory(allItems, page, title, holder, false);
     }
 
@@ -1359,20 +1431,24 @@ public class CoinShop extends JavaPlugin implements Listener {
             ItemMeta meta = displayItem.getItemMeta();
             List<String> lore = meta.hasLore() ? meta.getLore() : new ArrayList<>();
             lore.add("");
-            lore.add(ChatColor.GOLD + "Price: " + ChatColor.WHITE + formatCoin(shopItem.price));
+            lore.add("§6Price: §f" + formatCoin(shopItem.price));
             if (taxRate > 0) {
                 BigDecimal total = shopItem.price.add(shopItem.price.multiply(BigDecimal.valueOf(taxRate)))
                         .setScale(8, RoundingMode.DOWN);
-                lore.add(ChatColor.GRAY + "Total with tax: " + ChatColor.WHITE + formatCoin(total));
+                lore.add("§7Total with tax: §f" + formatCoin(total));
             }
-            lore.add(ChatColor.GRAY + "Seller: " + ChatColor.WHITE + 
+            lore.add("§7Seller: §f" + 
                     (shopItem.sellerShopName != null ? shopItem.sellerShopName : "Unknown"));
+            
+            // Adicionar identificador único na lore para comparação
+            lore.add("§8ID: " + shopItem.transactionId);
+            
             if (isMyShop) {
                 lore.add("");
-                lore.add(ChatColor.RED + "Click to cancel listing");
+                lore.add("§cClick to cancel listing");
             } else {
                 lore.add("");
-                lore.add(ChatColor.GREEN + "Click to purchase");
+                lore.add("§aClick to purchase");
             }
             meta.setLore(lore);
             displayItem.setItemMeta(meta);
@@ -1381,17 +1457,24 @@ public class CoinShop extends JavaPlugin implements Listener {
 
         ItemStack prev = new ItemStack(Material.ARROW);
         ItemMeta prevMeta = prev.getItemMeta();
-        prevMeta.setDisplayName(ChatColor.GREEN + "Previous Page");
+        prevMeta.setDisplayName("§aPrevious Page");
         prev.setItemMeta(prevMeta);
         
         ItemStack next = new ItemStack(Material.ARROW);
         ItemMeta nextMeta = next.getItemMeta();
-        nextMeta.setDisplayName(ChatColor.GREEN + "Next Page");
+        nextMeta.setDisplayName("§aNext Page");
         next.setItemMeta(nextMeta);
         
+        // Botão voltar para categorias ou menu principal
         ItemStack back = new ItemStack(Material.BARRIER);
         ItemMeta backMeta = back.getItemMeta();
-        backMeta.setDisplayName(ChatColor.RED + "Back to Main Menu");
+        
+        if (holder.getType() == ShopInventoryHolder.Type.CATEGORY_SHOP) {
+            backMeta.setDisplayName("§aBack to Categories");
+        } else {
+            backMeta.setDisplayName("§aBack to Main Menu");
+        }
+        
         back.setItemMeta(backMeta);
 
         ItemStack filler = new ItemStack(Material.GRAY_STAINED_GLASS_PANE);
@@ -1450,7 +1533,7 @@ public class CoinShop extends JavaPlugin implements Listener {
         if (!holder.getViewerUuid().equals(player.getUniqueId())) {
             event.setCancelled(true);
             player.closeInventory();
-            player.sendMessage(ChatColor.RED + "This inventory does not belong to you!");
+            player.sendMessage("§cThis inventory does not belong to you!");
             return;
         }
 
@@ -1484,29 +1567,45 @@ public class CoinShop extends JavaPlugin implements Listener {
                     player.openInventory(buildMainMenu(player));
                     return;
                 }
-                if (slot < ItemCategory.values().length) {
-                    ItemCategory category = ItemCategory.values()[slot];
+                
+                // Mapear slots para categorias
+                int categorySlot = -1;
+                int[] categorySlots = {10, 11, 12, 13, 14, 15, 16, 19, 20, 21, 22, 23};
+                for (int i = 0; i < categorySlots.length; i++) {
+                    if (slot == categorySlots[i]) {
+                        categorySlot = i;
+                        break;
+                    }
+                }
+                
+                if (categorySlot >= 0 && categorySlot < ItemCategory.values().length) {
+                    ItemCategory category = ItemCategory.values()[categorySlot];
                     player.openInventory(buildCategoryShopMenu(player, category, 0));
                 }
                 break;
 
             case CATEGORY_SHOP:
-                handlePagedShopClick(player, holder.getCategory(), page, slot, false);
+                handlePagedShopClick(player, holder.getCategory(), page, slot, event.getCurrentItem(), false);
                 break;
 
             case MY_SHOP:
-                handlePagedShopClick(player, null, page, slot, true);
+                handlePagedShopClick(player, null, page, slot, event.getCurrentItem(), true);
                 break;
 
             case GLOBAL_SHOP:
-                handlePagedShopClick(player, null, page, slot, false);
+                handlePagedShopClick(player, null, page, slot, event.getCurrentItem(), false);
                 break;
         }
     }
 
-    private void handlePagedShopClick(Player player, ItemCategory category, int page, int slot, boolean isMyShop) {
+    private void handlePagedShopClick(Player player, ItemCategory category, int page, int slot, 
+                                       ItemStack clickedItem, boolean isMyShop) {
         if (slot == 49) {
-            player.openInventory(buildMainMenu(player));
+            if (category != null) {
+                player.openInventory(buildCategoriesMenu(player));
+            } else {
+                player.openInventory(buildMainMenu(player));
+            }
             return;
         }
 
@@ -1527,7 +1626,18 @@ public class CoinShop extends JavaPlugin implements Listener {
         int index = page * 45 + slot;
         if (index >= items.size()) return;
 
+        // Extrair ID do item clicado
+        String clickedId = extractItemId(clickedItem);
+        if (clickedId == null) return;
+
         ShopItem shopItem = items.get(index);
+        
+        // Verificar se o ID corresponde
+        if (!shopItem.transactionId.equals(clickedId)) {
+            player.sendMessage("§cThis item is no longer available!");
+            refreshPlayerShop(player);
+            return;
+        }
 
         if (isMyShop) {
             cancelListing(player, shopItem);
@@ -1535,6 +1645,18 @@ public class CoinShop extends JavaPlugin implements Listener {
         } else {
             purchaseItem(player, shopItem);
         }
+    }
+    
+    private String extractItemId(ItemStack item) {
+        if (item == null || !item.hasItemMeta() || !item.getItemMeta().hasLore()) return null;
+        
+        for (String line : item.getItemMeta().getLore()) {
+            String cleanLine = ChatColor.stripColor(line);
+            if (cleanLine.startsWith("ID: ")) {
+                return cleanLine.substring(4);
+            }
+        }
+        return null;
     }
 
     private void reopenPage(Player player, ItemCategory category, int page, boolean isMyShop) {
@@ -1577,141 +1699,87 @@ public class CoinShop extends JavaPlugin implements Listener {
             return;
         }
 
-        // Obter a lista de itens baseado no tipo de loja
-        List<ShopItem> items;
-        if (holder.getType() == ShopInventoryHolder.Type.MY_SHOP) {
-            items = storeData.items.stream()
-                    .filter(item -> item != null && item.sellerUuid != null && 
-                           item.sellerUuid.equals(admin.getUniqueId()))
-                    .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
-                    .collect(Collectors.toList());
-        } else if (holder.getType() == ShopInventoryHolder.Type.CATEGORY_SHOP && holder.getCategory() != null) {
-            ItemCategory category = holder.getCategory();
-            items = storeData.items.stream()
-                    .filter(item -> item != null && item.item != null)
-                    .filter(item -> category == ItemCategory.ALL || 
-                           ItemCategory.fromMaterial(item.item.getType()) == category)
-                    .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
-                    .collect(Collectors.toList());
-        } else {
-            items = storeData.items.stream()
-                    .filter(Objects::nonNull)
-                    .sorted((a, b) -> Long.compare(b.listedAt, a.listedAt))
-                    .collect(Collectors.toList());
-        }
-        
-        int page = holder.getPage();
-        
-        // Calcular o índice correto baseado no slot e página
-        if (slot < 45) { // Apenas slots de itens (não botões de navegação)
-            int index = page * 45 + slot;
-            
-            if (index < items.size()) {
-                ShopItem itemToCancel = items.get(index);
-                
-                // Verificar se o item clicado corresponde ao item encontrado
-                String clickedPrice = null;
-                String clickedSeller = null;
-                
-                List<String> lore = clickedItem.getItemMeta().getLore();
-                if (lore != null) {
-                    for (String line : lore) {
-                        String cleanLine = ChatColor.stripColor(line);
-                        if (cleanLine.contains("Price:")) {
-                            clickedPrice = cleanLine.replace("Price:", "").trim();
-                        } else if (cleanLine.contains("Seller:")) {
-                            clickedSeller = cleanLine.replace("Seller:", "").trim();
-                        }
-                    }
-                }
-                
-                String itemPrice = formatCoin(itemToCancel.price);
-                String itemSeller = itemToCancel.sellerShopName;
-                
-                // Verificar se os dados do item clicado correspondem ao item encontrado
-                boolean matches = true;
-                if (clickedPrice != null && !clickedPrice.equals(itemPrice)) {
-                    matches = false;
-                }
-                if (clickedSeller != null && !clickedSeller.equals(itemSeller)) {
-                    matches = false;
-                }
-                
-                if (!matches) {
-                    admin.sendMessage(ChatColor.RED + "Could not identify the correct item to cancel!");
-                    return;
-                }
-                
-                // Remover o item da loja
-                if (storeData.items.remove(itemToCancel)) {
-                    saveStoreData();
-                    
-                    // Tentar devolver ao vendedor original
-                    Player seller = Bukkit.getPlayer(itemToCancel.sellerUuid);
-                    String itemName = itemToCancel.item.getType().toString();
-                    if (itemToCancel.item.getItemMeta() != null && 
-                        itemToCancel.item.getItemMeta().hasDisplayName()) {
-                        itemName = itemToCancel.item.getItemMeta().getDisplayName();
-                    }
-                    
-                    if (seller != null && seller.isOnline()) {
-                        // Vendedor online - tentar dar o item
-                        HashMap<Integer, ItemStack> leftover = seller.getInventory().addItem(itemToCancel.item.clone());
-                        
-                        if (!leftover.isEmpty()) {
-                            // Inventário cheio - dropar no chão
-                            World world = seller.getWorld();
-                            Location loc = seller.getLocation();
-                            for (ItemStack drop : leftover.values()) {
-                                if (drop != null) {
-                                    world.dropItemNaturally(loc, drop);
-                                }
-                            }
-                            seller.sendMessage(ChatColor.YELLOW + "Your inventory was full! Some items were dropped on the ground.");
-                        }
-                        
-                        // Notificar o vendedor
-                        seller.sendMessage(ChatColor.RED + "ADMIN CANCELLATION");
-                        seller.sendMessage(ChatColor.GRAY + "An admin has cancelled your listing:");
-                        seller.sendMessage(ChatColor.GRAY + "Item: " + ChatColor.WHITE + itemToCancel.item.getAmount() + "x " + itemName);
-                        seller.sendMessage(ChatColor.GRAY + "Price: " + ChatColor.WHITE + formatCoin(itemToCancel.price));
-                        seller.sendMessage(ChatColor.GRAY + "Admin: " + ChatColor.WHITE + admin.getName());
-                        seller.sendMessage(ChatColor.GREEN + "The item has been returned to your inventory.");
-                        
-                    } else {
-                        // Vendedor offline - armazenar para entrega posterior
-                        pendingItemReturns.computeIfAbsent(itemToCancel.sellerUuid, k -> new ArrayList<>())
-                                .add(itemToCancel.item.clone());
-                        savePendingReturns();
-                        
-                        getLogger().info("Item cancelled by admin " + admin.getName() + 
-                                " for offline player " + itemToCancel.sellerUuid + 
-                                " - Item stored for later delivery");
-                    }
-                    
-                    // Notificar o admin
-                    admin.sendMessage(ChatColor.GREEN + "ITEM CANCELLED SUCCESSFULLY");
-                    admin.sendMessage(ChatColor.GRAY + "Item: " + ChatColor.WHITE + itemToCancel.item.getAmount() + "x " + itemName);
-                    admin.sendMessage(ChatColor.GRAY + "Seller: " + ChatColor.WHITE + itemToCancel.sellerShopName);
-                    admin.sendMessage(ChatColor.GRAY + "Price: " + ChatColor.WHITE + formatCoin(itemToCancel.price));
-                    
-                    if (seller != null && seller.isOnline()) {
-                        admin.sendMessage(ChatColor.GREEN + "Item returned to seller (online)");
-                    } else {
-                        admin.sendMessage(ChatColor.YELLOW + "Seller is offline - Item will be returned when they join");
-                    }
-                    
-                    // Recarregar a página
-                    reopenPage(admin, holder.getCategory(), page, 
-                              holder.getType() == ShopInventoryHolder.Type.MY_SHOP);
-                } else {
-                    admin.sendMessage(ChatColor.RED + "Item no longer exists in shop!");
-                }
-            } else {
-                admin.sendMessage(ChatColor.RED + "Item index out of range!");
+        String clickedId = extractItemId(clickedItem);
+        if (clickedId == null) return;
+
+        // Encontrar o item pelo ID
+        ShopItem itemToCancel = null;
+        for (ShopItem item : storeData.items) {
+            if (item.transactionId.equals(clickedId)) {
+                itemToCancel = item;
+                break;
             }
+        }
+
+        if (itemToCancel == null) {
+            admin.sendMessage("§cItem no longer exists in shop!");
+            refreshPlayerShop(admin);
+            return;
+        }
+
+        // Remover o item da loja
+        if (storeData.items.remove(itemToCancel)) {
+            saveStoreData();
+            
+            // Tentar devolver ao vendedor original
+            Player seller = Bukkit.getPlayer(itemToCancel.sellerUuid);
+            String itemName = itemToCancel.item.getType().toString();
+            if (itemToCancel.item.getItemMeta() != null && 
+                itemToCancel.item.getItemMeta().hasDisplayName()) {
+                itemName = itemToCancel.item.getItemMeta().getDisplayName();
+            }
+            
+            if (seller != null && seller.isOnline()) {
+                // Vendedor online - tentar dar o item
+                HashMap<Integer, ItemStack> leftover = seller.getInventory().addItem(itemToCancel.item.clone());
+                
+                if (!leftover.isEmpty()) {
+                    // Inventário cheio - dropar no chão
+                    World world = seller.getWorld();
+                    Location loc = seller.getLocation();
+                    for (ItemStack drop : leftover.values()) {
+                        if (drop != null) {
+                            world.dropItemNaturally(loc, drop);
+                        }
+                    }
+                    seller.sendMessage("§eYour inventory was full! Some items were dropped on the ground.");
+                }
+                
+                // Notificar o vendedor
+                seller.sendMessage("§cADMIN CANCELLATION");
+                seller.sendMessage("§7An admin has cancelled your listing:");
+                seller.sendMessage("§7Item: §f" + itemToCancel.item.getAmount() + "x " + itemName);
+                seller.sendMessage("§7Price: §f" + formatCoin(itemToCancel.price));
+                seller.sendMessage("§7Admin: §f" + admin.getName());
+                seller.sendMessage("§aThe item has been returned to your inventory.");
+                
+            } else {
+                // Vendedor offline - armazenar para entrega posterior
+                pendingItemReturns.computeIfAbsent(itemToCancel.sellerUuid, k -> new ArrayList<>())
+                        .add(itemToCancel.item.clone());
+                savePendingReturns();
+                
+                getLogger().info("Item cancelled by admin " + admin.getName() + 
+                        " for offline player " + itemToCancel.sellerUuid + 
+                        " - Item stored for later delivery");
+            }
+            
+            // Notificar o admin
+            admin.sendMessage("§aITEM CANCELLED SUCCESSFULLY");
+            admin.sendMessage("§7Item: §f" + itemToCancel.item.getAmount() + "x " + itemName);
+            admin.sendMessage("§7Seller: §f" + itemToCancel.sellerShopName);
+            admin.sendMessage("§7Price: §f" + formatCoin(itemToCancel.price));
+            
+            if (seller != null && seller.isOnline()) {
+                admin.sendMessage("§aItem returned to seller (online)");
+            } else {
+                admin.sendMessage("§eSeller is offline - Item will be returned when they join");
+            }
+            
+            // Recarregar a página
+            refreshAllOpenShops();
         } else {
-            admin.sendMessage(ChatColor.RED + "This is not a valid item slot!");
+            admin.sendMessage("§cItem no longer exists in shop!");
         }
     }
 
@@ -1743,6 +1811,7 @@ public class CoinShop extends JavaPlugin implements Listener {
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent event) {
         playerSessions.remove(event.getPlayer().getUniqueId());
+        playerPurchaseCooldown.remove(event.getPlayer().getUniqueId());
     }
 
     @EventHandler
@@ -1765,11 +1834,11 @@ public class CoinShop extends JavaPlugin implements Listener {
             if (!(sender instanceof Player)) {
                 if (args.length > 0 && args[0].equalsIgnoreCase("reload")) {
                     if (!sender.hasPermission("coinshop.admin")) {
-                        sender.sendMessage(ChatColor.RED + "You don't have permission!");
+                        sender.sendMessage("§cYou don't have permission!");
                         return true;
                     }
                     loadConfig();
-                    sender.sendMessage(ChatColor.GREEN + "CoinShop configuration reloaded!");
+                    sender.sendMessage("§aCoinShop configuration reloaded!");
                     return true;
                 }
                 sender.sendMessage("This command can only be used by players.");
@@ -1786,16 +1855,16 @@ public class CoinShop extends JavaPlugin implements Listener {
             switch (args[0].toLowerCase()) {
                 case "reload":
                     if (!player.hasPermission("coinshop.admin")) {
-                        player.sendMessage(ChatColor.RED + "You don't have permission!");
+                        player.sendMessage("§cYou don't have permission!");
                         return true;
                     }
                     loadConfig();
-                    player.sendMessage(ChatColor.GREEN + "CoinShop configuration reloaded!");
+                    player.sendMessage("§aCoinShop configuration reloaded!");
                     break;
 
                 case "sell":
                     if (args.length < 3) {
-                        player.sendMessage(ChatColor.RED + "Usage: /cshop sell <amount> <price>");
+                        player.sendMessage("§cUsage: /cshop sell <amount> <price>");
                         return true;
                     }
                     handleSellCommand(player, args);
@@ -1807,7 +1876,7 @@ public class CoinShop extends JavaPlugin implements Listener {
 
                 case "name":
                     if (args.length < 2) {
-                        player.sendMessage(ChatColor.RED + "Usage: /cshop name <shop name>");
+                        player.sendMessage("§cUsage: /cshop name <shop name>");
                         return true;
                     }
                     String shopName = String.join(" ", Arrays.copyOfRange(args, 1, args.length));
@@ -1830,14 +1899,14 @@ public class CoinShop extends JavaPlugin implements Listener {
             if (player == null) return;
             
             if (shopName.length() > 32) {
-                player.sendMessage(ChatColor.RED + "Shop name too long! Maximum 32 characters.");
+                player.sendMessage("§cShop name too long! Maximum 32 characters.");
                 return;
             }
             PlayerData data = getPlayerData(player.getUniqueId());
             if (data != null) {
                 data.shopName = shopName;
                 savePlayerData(data);
-                player.sendMessage(ChatColor.GREEN + "Your shop name has been set to: " + shopName);
+                player.sendMessage("§aYour shop name has been set to: " + shopName);
             }
         }
 
@@ -1851,7 +1920,7 @@ public class CoinShop extends JavaPlugin implements Listener {
             
             ItemStack item = player.getInventory().getItemInMainHand();
             if (item == null || item.getType() == Material.AIR) {
-                player.sendMessage(ChatColor.RED + "You must hold an item to sell!");
+                player.sendMessage("§cYou must hold an item to sell!");
                 return;
             }
 
@@ -1859,11 +1928,11 @@ public class CoinShop extends JavaPlugin implements Listener {
             try {
                 amount = Integer.parseInt(args[1]);
                 if (amount <= 0 || amount > item.getAmount()) {
-                    player.sendMessage(ChatColor.RED + "Invalid amount!");
+                    player.sendMessage("§cInvalid amount!");
                     return;
                 }
             } catch (NumberFormatException e) {
-                player.sendMessage(ChatColor.RED + "Amount must be a number!");
+                player.sendMessage("§cAmount must be a number!");
                 return;
             }
 
@@ -1880,7 +1949,7 @@ public class CoinShop extends JavaPlugin implements Listener {
                     // Exemplo: 150 -> 0.00000150
                     long intValue = Long.parseLong(priceStr);
                     if (intValue <= 0) {
-                        player.sendMessage(ChatColor.RED + "Price must be positive!");
+                        player.sendMessage("§cPrice must be positive!");
                         return;
                     }
                     // Converter para BigDecimal dividindo por 100.000.000 (10^8)
@@ -1889,7 +1958,7 @@ public class CoinShop extends JavaPlugin implements Listener {
                 
                 // Validar se o preço é positivo
                 if (price.compareTo(BigDecimal.ZERO) <= 0) {
-                    player.sendMessage(ChatColor.RED + "Price must be positive!");
+                    player.sendMessage("§cPrice must be positive!");
                     return;
                 }
                 
@@ -1897,7 +1966,7 @@ public class CoinShop extends JavaPlugin implements Listener {
                 price = price.setScale(8, RoundingMode.DOWN);
                 
             } catch (NumberFormatException e) {
-                player.sendMessage(ChatColor.RED + "Invalid price format! Use numbers like 1.5, 0.001, or 150");
+                player.sendMessage("§cInvalid price format! Use numbers like 1.5, 0.001, or 150");
                 return;
             }
 
@@ -1909,7 +1978,7 @@ public class CoinShop extends JavaPlugin implements Listener {
             createListing(player, sellItem, price);
             
             // Mostrar o preço formatado para o jogador
-            player.sendMessage(ChatColor.GRAY + "Price set to: " + ChatColor.GREEN + formatCoin(price));
+            player.sendMessage("§7Price set to: §a" + formatCoin(price));
         }
 
         private void checkPlayerBalanceCommand(Player player) {
@@ -1917,20 +1986,19 @@ public class CoinShop extends JavaPlugin implements Listener {
             
             // Verificar se o jogador tem card usando a API
             if (!hasPlayerCard(player.getUniqueId())) {
-                player.sendMessage(ChatColor.RED + "You don't have a card set! Use /coin card <card> to set your card.");
+                player.sendMessage("§cYou don't have a card set! Use /coin card <card> to set your card.");
                 return;
             }
 
             getPlayerBalanceByUUID(player.getUniqueId(), new BalanceCheckCallback() {
                 @Override
                 public void onSuccess(BigDecimal balance) {
-                    player.sendMessage(ChatColor.GREEN + "Your CoinCard balance: " + 
-                            ChatColor.YELLOW + formatCoin(balance));
+                    player.sendMessage("§aYour CoinCard balance: §e" + formatCoin(balance));
                 }
 
                 @Override
                 public void onFailure(String error) {
-                    player.sendMessage(ChatColor.RED + "Failed to check balance: " + (error != null ? error : "Unknown error"));
+                    player.sendMessage("§cFailed to check balance: " + (error != null ? error : "Unknown error"));
                 }
             });
         }

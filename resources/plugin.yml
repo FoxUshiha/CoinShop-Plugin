@@ -1,5 +1,5 @@
 name: CoinShop
-version: 2.7
+version: 2.8
 main: com.foxsrv.coinshop.CoinShop
 api-version: 1.20
 author: FoxOficial2
