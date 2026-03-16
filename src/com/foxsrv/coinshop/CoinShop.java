@@ -856,7 +856,7 @@ public class CoinShop extends JavaPlugin implements Listener {
         
         Bukkit.broadcastMessage(announcement);
 
-        player.sendMessage(ChatColor.GREEN + "✓ Item listed for sale at " + formatCoin(price) + " coins!");
+        player.sendMessage(ChatColor.GREEN + "Item listed for sale at " + formatCoin(price) + " coins!");
         return true;
     }
 
